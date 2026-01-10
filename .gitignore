@@ -1,3 +1,9 @@
+# Cython generated files
+*.c
+*.pyd
+*.so
+*.html
+
 # Python-generated files
 __pycache__/
 *.py[oc]

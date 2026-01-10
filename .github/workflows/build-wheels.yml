@@ -1,0 +1,122 @@
+# GitHub Actions: Build Cython Wheels
+#
+# 跨平台建置 csp_lib 二進位 wheel
+# 支援: Windows, Ubuntu, Rocky Linux (透過 manylinux)
+#
+# 觸發策略 (節省額度):
+#   - PR: 只跑測試 (不建置 wheel)
+#   - Tag (v*): 測試 + 建置 + 發布
+#   - 手動觸發: 完整流程
+
+name: Build Wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ============ 測試 (PR + Tag 都會跑) ============
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+          pip install pytest pytest-asyncio
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ============ 建置 Wheel (只有 Tag 和手動觸發) ============
+  build_wheels:
+    name: Build wheel on ${{ matrix.os }}
+    needs: [test]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cython build wheel setuptools
+
+      - name: Build wheel
+        run: python build_wheel.py
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: dist/*.whl
+
+  build_manylinux:
+    name: Build manylinux wheel
+    needs: [test]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build manylinux wheel
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          CIBW_BUILD: "cp313-manylinux_x86_64"
+          CIBW_BEFORE_BUILD: "pip install cython"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+
+      - name: Upload manylinux wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-manylinux
+          path: wheelhouse/*.whl
+
+  # ============ 發布 (只有 Tag) ============
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, build_manylinux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist/
