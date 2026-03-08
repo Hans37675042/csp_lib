@@ -3,11 +3,15 @@
 # 傳輸層模組匯出
 
 from .base import PointGrouper, ReadGroup
+from .config import PointGrouperConfig
+from .periodic_sender import PeriodicFrameConfig, PeriodicSendScheduler
 from .reader import GroupReader
 from .scheduler import ReadScheduler
 from .writer import ValidatedWriter, WriteResult, WriteStatus
 
 __all__ = [
+    # Config
+    "PointGrouperConfig",
     # Base
     "ReadGroup",
     "PointGrouper",
@@ -19,4 +23,7 @@ __all__ = [
     "WriteStatus",
     "WriteResult",
     "ValidatedWriter",
+    # Periodic Sender
+    "PeriodicFrameConfig",
+    "PeriodicSendScheduler",
 ]

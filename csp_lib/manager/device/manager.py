@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Sequence
 
-from csp_lib.core import get_logger
+from csp_lib.core import AsyncLifecycleMixin, get_logger
+from csp_lib.core.errors import DeviceConnectionError
 
 from .group import DeviceGroup
 
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class DeviceManager:
+class DeviceManager(AsyncLifecycleMixin):
     """
     設備讀取管理器
 
@@ -100,7 +101,7 @@ class DeviceManager:
 
     # ================ 生命週期 ================
 
-    async def start(self) -> None:
+    async def _on_start(self) -> None:
         """
         啟動所有設備
 
@@ -116,7 +117,7 @@ class DeviceManager:
         for device in self._standalone:
             try:
                 await device.connect()
-            except Exception as e:
+            except DeviceConnectionError as e:
                 logger.warning(f"設備 {device.device_id} 連線失敗，將在背景重試: {e}")
             # 無論連線成功與否都啟動 read_loop（會在背景自動重連）
             await device.start()
@@ -126,14 +127,14 @@ class DeviceManager:
             for device in group.devices:
                 try:
                     await device.connect()
-                except Exception as e:
+                except DeviceConnectionError as e:
                     logger.warning(f"設備 {device.device_id} 連線失敗，將在背景重試: {e}")
                 await device._emitter.start()
             group.start()
 
         logger.info(f"DeviceManager 已啟動: {len(self._standalone)} 個獨立設備, {len(self._groups)} 個群組")
 
-    async def stop(self) -> None:
+    async def _on_stop(self) -> None:
         """
         停止所有設備
 
@@ -156,19 +157,10 @@ class DeviceManager:
                 await device._emitter.stop()
                 try:
                     await device.disconnect()
-                except Exception as e:
+                except DeviceConnectionError as e:
                     logger.debug(f"設備 {device.device_id} 斷線失敗（已忽略）: {e}")
 
         logger.info("DeviceManager 已停止")
-
-    async def __aenter__(self) -> DeviceManager:
-        """Context manager 進入"""
-        await self.start()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager 離開"""
-        await self.stop()
 
     # ================ 屬性 ================
 

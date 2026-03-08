@@ -8,48 +8,75 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from csp_lib.equipment.alarm import AlarmEvaluator, AlarmEventType, AlarmState, AlarmStateManager
+from csp_lib.core.errors import CommunicationError, ConfigurationError, DeviceConnectionError
+from csp_lib.core.health import HealthReport, HealthStatus
+from csp_lib.equipment.alarm import AlarmEvaluator, AlarmStateManager
 from csp_lib.equipment.processing import AggregatorPipeline
 from csp_lib.equipment.transport import (
     GroupReader,
     PointGrouper,
     ReadScheduler,
     ValidatedWriter,
-    WriteResult,
-    WriteStatus,
 )
 
+from .capability import Capability, CapabilityBinding
 from .config import DeviceConfig
 from .events import (
-    EVENT_ALARM_CLEARED,
-    EVENT_ALARM_TRIGGERED,
     EVENT_CONNECTED,
     EVENT_DISCONNECTED,
+    EVENT_POINT_TOGGLED,
     EVENT_READ_COMPLETE,
     EVENT_READ_ERROR,
+    EVENT_RECONFIGURED,
+    EVENT_RESTARTED,
     EVENT_VALUE_CHANGE,
-    EVENT_WRITE_COMPLETE,
-    EVENT_WRITE_ERROR,
     AsyncHandler,
     ConnectedPayload,
-    DeviceAlarmPayload,
     DeviceEventEmitter,
     DisconnectPayload,
+    PointToggledPayload,
     ReadCompletePayload,
     ReadErrorPayload,
+    ReconfiguredPayload,
+    RestartedPayload,
     ValueChangePayload,
-    WriteCompletePayload,
-    WriteErrorPayload,
 )
+from .mixins import AlarmMixin, WriteMixin
 
 if TYPE_CHECKING:
-    from csp_lib.equipment.core import ReadPoint, WritePoint
+    from csp_lib.equipment.core import PointMetadata, ReadPoint, WritePoint
     from csp_lib.modbus.clients.base import AsyncModbusClientBase
+    from csp_lib.modbus.types import ModbusDataType
 
 
-class AsyncModbusDevice:
+@dataclass(frozen=True, slots=True)
+class PointInfo:
+    """點位詳細資訊"""
+
+    name: str
+    address: int
+    data_type: ModbusDataType
+    direction: str  # "read" | "write" | "read_write"
+    enabled: bool
+    read_group: str
+    metadata: PointMetadata | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconfigureSpec:
+    """重新配置規格"""
+
+    always_points: Sequence[ReadPoint] | None = None
+    rotating_points: Sequence[Sequence[ReadPoint]] | None = None
+    write_points: Sequence[WritePoint] | None = None
+    alarm_evaluators: Sequence[AlarmEvaluator] | None = None
+    capability_bindings: Sequence[CapabilityBinding] | None = None
+
+
+class AsyncModbusDevice(AlarmMixin, WriteMixin):
     """
     非同步 Modbus 設備
 
@@ -80,9 +107,14 @@ class AsyncModbusDevice:
         write_points: Sequence[WritePoint] = (),
         alarm_evaluators: Sequence[AlarmEvaluator] = (),
         aggregator_pipeline: AggregatorPipeline | None = None,
+        capability_bindings: Sequence[CapabilityBinding] = (),
     ):
         self._config = config
         self._client = client
+
+        # 儲存原始點位定義
+        self._read_points_always: tuple[ReadPoint, ...] = tuple(always_points)
+        self._read_points_rotating: tuple[tuple[ReadPoint, ...], ...] = tuple(tuple(pts) for pts in rotating_points)
 
         # 建立排程器（自動分組）
         self._grouper = PointGrouper()
@@ -115,6 +147,12 @@ class AsyncModbusDevice:
         # 設備層級聚合處理
         self._aggregator_pipeline = aggregator_pipeline
 
+        # 能力綁定
+        self._capability_bindings: dict[str, CapabilityBinding] = {b.capability.name: b for b in capability_bindings}
+
+        # 點位開關
+        self._disabled_points: set[str] = set()
+
         # 事件
         self._emitter = DeviceEventEmitter()
 
@@ -123,6 +161,7 @@ class AsyncModbusDevice:
         self._client_connected = False  # Socket 層級：client.connect() 是否成功
         self._device_responsive = False  # 通訊層級：設備是否有回應
         self._consecutive_failures = 0  # 連續讀取失敗次數
+        self._last_failure_time: float | None = None  # 最後一次讀取失敗的時間（monotonic）
         self._stop_event = asyncio.Event()
         self._read_task: asyncio.Task[None] | None = None
 
@@ -142,11 +181,6 @@ class AsyncModbusDevice:
     def is_responsive(self) -> bool:
         """設備是否有回應（通訊層級）"""
         return self._device_responsive
-
-    @property
-    def is_protected(self) -> bool:
-        """設備是否已保護"""
-        return self._alarm_manager.has_protection_alarm()
 
     @property
     def is_disconnected(self) -> bool:
@@ -169,14 +203,270 @@ class AsyncModbusDevice:
         return self._latest_values.copy()
 
     @property
-    def active_alarms(self) -> list[AlarmState]:
-        """啟用中的告警"""
-        return self._alarm_manager.get_active_alarms()
-
-    @property
     def is_running(self) -> bool:
         """讀取循環是否運行中"""
         return self._read_task is not None and not self._read_task.done()
+
+    @property
+    def should_attempt_read(self) -> bool:
+        """
+        是否應嘗試讀取（用於群組讀取排程）
+
+        回應中的設備或尚未失敗的設備永遠回傳 True。
+        無回應的設備在超過 reconnect_interval 後才回傳 True，避免 timeout 阻塞群組讀取。
+        """
+        if self._device_responsive:
+            return True
+        if self._last_failure_time is None:
+            return True
+        return (time.monotonic() - self._last_failure_time) >= self._config.reconnect_interval
+
+    # =============== Capabilities ===============
+
+    @property
+    def capabilities(self) -> dict[str, CapabilityBinding]:
+        """所有已綁定的能力"""
+        return dict(self._capability_bindings)
+
+    def has_capability(self, capability: Capability | str) -> bool:
+        """檢查設備是否具備指定能力"""
+        name = capability.name if isinstance(capability, Capability) else capability
+        return name in self._capability_bindings
+
+    def get_binding(self, capability: Capability | str) -> CapabilityBinding | None:
+        """取得能力綁定，不存在回傳 None"""
+        name = capability.name if isinstance(capability, Capability) else capability
+        return self._capability_bindings.get(name)
+
+    def resolve_point(self, capability: Capability | str, slot: str) -> str:
+        """
+        解析能力的語意插槽到實際點位名稱
+
+        Args:
+            capability: 能力定義或名稱
+            slot: 語意插槽名稱
+
+        Returns:
+            實際點位名稱
+
+        Raises:
+            ConfigurationError: 設備不具備該能力
+            KeyError: slot 不存在
+        """
+        binding = self.get_binding(capability)
+        if binding is None:
+            name = capability.name if isinstance(capability, Capability) else capability
+            raise ConfigurationError(f"Device '{self.device_id}' has no capability '{name}'")
+        return binding.resolve(slot)
+
+    def add_capability(self, binding: CapabilityBinding) -> None:
+        """動態新增能力綁定（執行期）"""
+        self._capability_bindings[binding.capability.name] = binding
+
+    def remove_capability(self, capability: Capability | str) -> None:
+        """動態移除能力綁定（執行期）"""
+        name = capability.name if isinstance(capability, Capability) else capability
+        self._capability_bindings.pop(name, None)
+
+    # =============== Point Toggle ===============
+
+    def enable_point(self, name: str) -> None:
+        """啟用點位"""
+        if name not in self.all_point_names:
+            raise KeyError(f"點位 '{name}' 不存在")
+        self._disabled_points.discard(name)
+        self._emitter.emit(
+            EVENT_POINT_TOGGLED,
+            PointToggledPayload(device_id=self._config.device_id, point_name=name, enabled=True),
+        )
+
+    def disable_point(self, name: str) -> None:
+        """停用點位（讀取值不更新、告警不評估、寫入被拒）"""
+        if name not in self.all_point_names:
+            raise KeyError(f"點位 '{name}' 不存在")
+        self._disabled_points.add(name)
+        self._emitter.emit(
+            EVENT_POINT_TOGGLED,
+            PointToggledPayload(device_id=self._config.device_id, point_name=name, enabled=False),
+        )
+
+    def is_point_enabled(self, name: str) -> bool:
+        """檢查點位是否啟用"""
+        return name not in self._disabled_points
+
+    # =============== Point Query ===============
+
+    @property
+    def read_points(self) -> tuple[ReadPoint, ...]:
+        """所有固定讀取點位"""
+        return self._read_points_always
+
+    @property
+    def rotating_read_points(self) -> tuple[tuple[ReadPoint, ...], ...]:
+        """所有輪替讀取點位"""
+        return self._read_points_rotating
+
+    @property
+    def write_point_names(self) -> list[str]:
+        """所有寫入點位名稱"""
+        return list(self._write_points.keys())
+
+    @property
+    def all_point_names(self) -> set[str]:
+        """所有點位名稱（讀+寫）"""
+        names = {p.name for p in self._read_points_always}
+        for group in self._read_points_rotating:
+            names.update(p.name for p in group)
+        names.update(self._write_points.keys())
+        return names
+
+    @property
+    def disabled_points(self) -> frozenset[str]:
+        """目前被停用的點位"""
+        return frozenset(self._disabled_points)
+
+    def get_point_info(self) -> list[PointInfo]:
+        """取得所有點位的詳細資訊（含啟用狀態）"""
+        infos: list[PointInfo] = []
+        write_names = set(self._write_points.keys())
+
+        # 讀取點位
+        for point in self._read_points_always:
+            direction = "read_write" if point.name in write_names else "read"
+            infos.append(
+                PointInfo(
+                    name=point.name,
+                    address=point.address,
+                    data_type=point.data_type,
+                    direction=direction,
+                    enabled=point.name not in self._disabled_points,
+                    read_group=point.read_group,
+                    metadata=point.metadata,
+                )
+            )
+
+        seen_names = {p.name for p in self._read_points_always}
+        for group in self._read_points_rotating:
+            for point in group:
+                if point.name in seen_names:
+                    continue
+                seen_names.add(point.name)
+                direction = "read_write" if point.name in write_names else "read"
+                infos.append(
+                    PointInfo(
+                        name=point.name,
+                        address=point.address,
+                        data_type=point.data_type,
+                        direction=direction,
+                        enabled=point.name not in self._disabled_points,
+                        read_group=point.read_group,
+                        metadata=point.metadata,
+                    )
+                )
+
+        # 僅寫入的點位
+        for name, wp in self._write_points.items():
+            if name not in seen_names:
+                infos.append(
+                    PointInfo(
+                        name=wp.name,
+                        address=wp.address,
+                        data_type=wp.data_type,
+                        direction="write",
+                        enabled=wp.name not in self._disabled_points,
+                        read_group="",
+                        metadata=wp.metadata,
+                    )
+                )
+
+        return infos
+
+    # =============== Reconfigure ===============
+
+    async def reconfigure(self, spec: ReconfigureSpec) -> None:
+        """
+        動態重新配置點位
+
+        Args:
+            spec: 重新配置規格，None 欄位表示保持不變
+        """
+        was_running = self.is_running
+        if was_running:
+            await self.stop()
+
+        changed_sections: list[str] = []
+
+        try:
+            if spec.always_points is not None or spec.rotating_points is not None:
+                if spec.always_points is not None:
+                    self._read_points_always = tuple(spec.always_points)
+                    changed_sections.append("always_points")
+                if spec.rotating_points is not None:
+                    self._read_points_rotating = tuple(tuple(pts) for pts in spec.rotating_points)
+                    changed_sections.append("rotating_points")
+                self._scheduler.update_groups(
+                    always_groups=self._grouper.group(list(self._read_points_always)),
+                    rotating_groups=[self._grouper.group(list(pts)) for pts in self._read_points_rotating],
+                )
+
+            if spec.write_points is not None:
+                self._write_points = {wp.name: wp for wp in spec.write_points}
+                changed_sections.append("write_points")
+
+            if spec.alarm_evaluators is not None:
+                old_states = self._alarm_manager.export_states()
+                self._alarm_manager = AlarmStateManager()
+                self._alarm_evaluators = list(spec.alarm_evaluators)
+                for evaluator in self._alarm_evaluators:
+                    self._alarm_manager.register_alarms(evaluator.get_alarms())
+                self._alarm_manager.import_states(old_states)
+                changed_sections.append("alarm_evaluators")
+
+            if spec.capability_bindings is not None:
+                self._capability_bindings = {b.capability.name: b for b in spec.capability_bindings}
+                changed_sections.append("capability_bindings")
+
+            # 清理不再存在的 disabled_points
+            valid_names = self.all_point_names
+            self._disabled_points = self._disabled_points & valid_names
+        finally:
+            if was_running:
+                await self.start()
+
+        self._emitter.emit(
+            EVENT_RECONFIGURED,
+            ReconfiguredPayload(device_id=self._config.device_id, changed_sections=tuple(changed_sections)),
+        )
+
+    async def restart(self) -> None:
+        """重啟讀取迴圈"""
+        await self.stop()
+        await self.start()
+        self._emitter.emit(
+            EVENT_RESTARTED,
+            RestartedPayload(device_id=self._config.device_id),
+        )
+
+    # =============== Health ===============
+
+    def health(self) -> HealthReport:
+        """取得設備健康報告"""
+        if self.is_healthy:
+            status = HealthStatus.HEALTHY
+        elif self.is_connected:
+            status = HealthStatus.DEGRADED
+        else:
+            status = HealthStatus.UNHEALTHY
+        return HealthReport(
+            status=status,
+            component=f"device:{self.device_id}",
+            details={
+                "connected": self.is_connected,
+                "responsive": self.is_responsive,
+                "protected": self.is_protected,
+                "active_alarms": len(self.active_alarms),
+            },
+        )
 
     # =============== Lifecycle ===============
 
@@ -185,9 +475,12 @@ class AsyncModbusDevice:
         連線設備
 
         Raises:
-            ConnectionError: 連線失敗
+            DeviceConnectionError: 連線失敗
         """
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception as e:
+            raise DeviceConnectionError(self._config.device_id, f"連線失敗: {e}") from e
         await self._emitter.start()  # 啟動事件處理 worker
         self._client_connected = True
         self._device_responsive = True  # 假設連線成功即可回應，讀取失敗會更新
@@ -199,14 +492,18 @@ class AsyncModbusDevice:
         斷線設備
 
         Raises:
-            ConnectionError: 斷線失敗
+            DeviceConnectionError: 斷線失敗
         """
         await self.stop()
         if self._client_connected:
-            await self._client.disconnect()
+            try:
+                await self._client.disconnect()
+            except Exception as e:
+                raise DeviceConnectionError(self._config.device_id, f"斷線失敗: {e}") from e
             self._client_connected = False
             self._device_responsive = False
             self._consecutive_failures = 0
+            self._last_failure_time = None
             await self._emitter.emit_await(
                 EVENT_DISCONNECTED,
                 DisconnectPayload(device_id=self._config.device_id, reason="normal", consecutive_failures=0),
@@ -251,8 +548,10 @@ class AsyncModbusDevice:
             raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        await self.stop()
-        await self.disconnect()
+        try:
+            await self.stop()
+        finally:
+            await self.disconnect()
 
     # =============== Transport ===============
 
@@ -276,15 +575,19 @@ class AsyncModbusDevice:
                 self._client_connected = True
                 # 注意：_device_responsive 保持 False，等讀取成功後才設為 True 並發送 EVENT_CONNECTED
                 self._consecutive_failures = 0
-            except Exception:
-                # 重連失敗，拋出讓呼叫者處理
+            except DeviceConnectionError:
+                self._last_failure_time = time.monotonic()
                 raise
+            except Exception as e:
+                self._last_failure_time = time.monotonic()
+                raise DeviceConnectionError(self._config.device_id, f"重連失敗: {e}") from e
 
         start_time = time.monotonic()
 
         try:
             values = await self._read_all()
             self._consecutive_failures = 0
+            self._last_failure_time = None
 
             # 設備恢復回應
             if not self._device_responsive:
@@ -312,113 +615,23 @@ class AsyncModbusDevice:
 
             return values
 
+        except CommunicationError as e:
+            # 已有正確 device_id 的 CommunicationError 直接傳播
+            if e.device_id != "unknown":
+                self._handle_read_failure(str(e))
+                await self._check_disconnect_threshold(str(e))
+                raise
+            # transport 層的 "unknown" device_id → 替換為正確 device_id
+            err = CommunicationError(self._config.device_id, str(e))
+            err.__cause__ = e.__cause__
+            self._handle_read_failure(str(err))
+            await self._check_disconnect_threshold(str(err))
+            raise err from e.__cause__
         except Exception as e:
-            self._consecutive_failures += 1
-            self._emitter.emit(
-                EVENT_READ_ERROR,
-                ReadErrorPayload(
-                    device_id=self._config.device_id,
-                    error=str(e),
-                    consecutive_failures=self._consecutive_failures,
-                ),
-            )
-
-            # 達到斷線閾值，標記設備無回應（Socket 仍可能連通）
-            if self._consecutive_failures >= self._config.disconnect_threshold and self._device_responsive:
-                self._device_responsive = False
-                await self._emitter.emit_await(
-                    EVENT_DISCONNECTED,
-                    DisconnectPayload(
-                        device_id=self._config.device_id,
-                        reason=str(e),
-                        consecutive_failures=self._consecutive_failures,
-                    ),
-                )
-
-            raise
-
-    async def write(self, name: str, value: Any, verify: bool = False) -> WriteResult:
-        """寫入點位值"""
-        point = self._write_points.get(name)
-        if point is None:
-            return WriteResult(
-                status=WriteStatus.VALIDATION_FAILED,
-                point_name=name,
-                value=value,
-                error_message=f"寫入點位 {name} 失敗，點位不存在",
-            )
-
-        result = await self._writer.write(point=point, value=value, verify=verify)
-
-        if result.status == WriteStatus.SUCCESS:
-            self._emitter.emit(
-                EVENT_WRITE_COMPLETE,
-                WriteCompletePayload(device_id=self._config.device_id, point_name=name, value=value),
-            )
-        else:
-            self._emitter.emit(
-                EVENT_WRITE_ERROR,
-                WriteErrorPayload(
-                    device_id=self._config.device_id, point_name=name, value=value, error=result.error_message
-                ),
-            )
-
-        return result
-
-    async def execute_action(self, action: str, **params: Any) -> WriteResult:
-        """
-        執行高階動作
-
-        根據 ACTIONS 映射呼叫對應的方法。
-
-        Args:
-            action: 動作名稱（如 "start", "stop"）
-            **params: 傳遞給方法的參數
-
-        Returns:
-            WriteResult：成功時 status=SUCCESS，失敗時包含錯誤訊息
-
-        Raises:
-            不拋出異常，所有錯誤透過 WriteResult 回傳
-        """
-        method_name = self.ACTIONS.get(action)
-        if method_name is None:
-            return WriteResult(
-                status=WriteStatus.VALIDATION_FAILED,
-                point_name=action,
-                value=None,
-                error_message=f"Action '{action}' not supported. Available: {list(self.ACTIONS.keys())}",
-            )
-
-        method = getattr(self, method_name, None)
-        if method is None or not callable(method):
-            return WriteResult(
-                status=WriteStatus.VALIDATION_FAILED,
-                point_name=action,
-                value=None,
-                error_message=f"Method '{method_name}' not found for action '{action}'",
-            )
-
-        try:
-            # 傳遞參數給 action 方法
-            await method(**params)
-            return WriteResult(
-                status=WriteStatus.SUCCESS,
-                point_name=action,
-                value=params if params else None,
-            )
-        except Exception as e:
-            return WriteResult(
-                status=WriteStatus.WRITE_FAILED,
-                point_name=action,
-                value=params if params else None,
-                error_message=str(e),
-            )
-
-    @property
-    def available_actions(self) -> list[str]:
-        """取得支援的動作列表"""
-        return list(self.ACTIONS.keys())
+            err = CommunicationError(self._config.device_id, f"讀取失敗: {e}")
+            self._handle_read_failure(str(err))
+            await self._check_disconnect_threshold(str(err))
+            raise err from e
 
     # =============== Events ================
 
@@ -429,15 +642,6 @@ class AsyncModbusDevice:
     def emit(self, event: str, payload: Any) -> None:
         """發送事件（非阻塞）"""
         self._emitter.emit(event, payload)
-
-    # =============== Alarm =================
-
-    async def clear_alarm(self, code: str) -> None:
-        """手動清除告警"""
-        event = self._alarm_manager.clear_alarm(code)
-        if event:
-            payload = DeviceAlarmPayload(device_id=self._config.device_id, alarm_event=event)
-            await self._emitter.emit_await(EVENT_ALARM_CLEARED, payload)  # 告警事件需同步處理
 
     # =============== Private ===============
 
@@ -467,6 +671,10 @@ class AsyncModbusDevice:
                     self._device_responsive = True
                     self._consecutive_failures = 0
                     await self._emitter.emit_await(EVENT_CONNECTED, ConnectedPayload(device_id=self._config.device_id))
+                except DeviceConnectionError:
+                    # 重連失敗，等待後重試
+                    await asyncio.sleep(reconnect_interval)
+                    continue
                 except Exception:
                     # 重連失敗，等待後重試
                     await asyncio.sleep(reconnect_interval)
@@ -481,9 +689,37 @@ class AsyncModbusDevice:
             sleep_time = max(0, interval - elapsed)
             await asyncio.sleep(sleep_time)
 
+    def _handle_read_failure(self, error_msg: str) -> None:
+        """處理讀取失敗：累加計數 + 記錄失敗時間 + 發送錯誤事件"""
+        self._consecutive_failures += 1
+        self._last_failure_time = time.monotonic()
+        self._emitter.emit(
+            EVENT_READ_ERROR,
+            ReadErrorPayload(
+                device_id=self._config.device_id,
+                error=error_msg,
+                consecutive_failures=self._consecutive_failures,
+            ),
+        )
+
+    async def _check_disconnect_threshold(self, error_msg: str) -> None:
+        """達到斷線閾值時標記設備無回應"""
+        if self._consecutive_failures >= self._config.disconnect_threshold and self._device_responsive:
+            self._device_responsive = False
+            await self._emitter.emit_await(
+                EVENT_DISCONNECTED,
+                DisconnectPayload(
+                    device_id=self._config.device_id,
+                    reason=error_msg,
+                    consecutive_failures=self._consecutive_failures,
+                ),
+            )
+
     async def _process_values(self, values: dict[str, Any]) -> None:
-        """處理讀取到的值，發送變更事件"""
+        """處理讀取到的值，發送變更事件（跳過 disabled 點位）"""
         for name, new_value in values.items():
+            if name in self._disabled_points:
+                continue
             old_value = self._latest_values.get(name)
             if old_value != new_value:
                 self._emitter.emit(
@@ -495,24 +731,7 @@ class AsyncModbusDevice:
                         new_value=new_value,
                     ),
                 )
-        self._latest_values.update(values)
-
-    async def _evaluate_alarm(self, values: dict[str, Any]) -> None:
-        """評估告警"""
-        for evaluator in self._alarm_evaluators:
-            point_value = values.get(evaluator.point_name)
-            if point_value is None:
-                continue
-
-            evaluations = evaluator.evaluate(point_value)
-            events = self._alarm_manager.update(evaluations)
-
-            for event in events:
-                payload = DeviceAlarmPayload(device_id=self._config.device_id, alarm_event=event)
-                if event.event_type == AlarmEventType.TRIGGERED:
-                    await self._emitter.emit_await(EVENT_ALARM_TRIGGERED, payload)
-                else:
-                    await self._emitter.emit_await(EVENT_ALARM_CLEARED, payload)
+            self._latest_values[name] = new_value
 
     # =============== Magic Methods =========
 

@@ -14,13 +14,16 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from csp_lib.core import get_logger
+from csp_lib.core import AsyncLifecycleMixin, get_logger
 from csp_lib.equipment.transport import WriteStatus
 
 from ..schema import ActionCommand, CommandSource
+from .config import CommandAdapterConfig
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
+
+    from csp_lib.integration.orchestrator import SystemCommandOrchestrator
 
     from ..manager import WriteCommandManager
 
@@ -71,7 +74,7 @@ class CommandResult:
 # ========== Redis Adapter ==========
 
 
-class RedisCommandAdapter:
+class RedisCommandAdapter(AsyncLifecycleMixin):
     """
     Redis Pub/Sub 指令適配器
 
@@ -105,15 +108,14 @@ class RedisCommandAdapter:
         ```
     """
 
-    DEFAULT_COMMAND_CHANNEL = "channel:commands:write"
-    DEFAULT_RESULT_CHANNEL = "channel:commands:result"
-
     def __init__(
         self,
         redis_client: Redis,
         manager: WriteCommandManager,
+        config: CommandAdapterConfig | None = None,
         command_channel: str | None = None,
         result_channel: str | None = None,
+        orchestrator: SystemCommandOrchestrator | None = None,
     ) -> None:
         """
         初始化 Redis 指令適配器
@@ -121,13 +123,22 @@ class RedisCommandAdapter:
         Args:
             redis_client: redis.asyncio.Redis 客戶端實例
             manager: 寫入指令管理器
-            command_channel: 接收指令的 channel
-            result_channel: 發布結果的 channel
+            config: 適配器配置（優先使用）
+            command_channel: 接收指令的 channel，config 為 None 時使用
+            result_channel: 發布結果的 channel，config 為 None 時使用
+            orchestrator: 系統指令編排器（可選，提供時支援系統級指令）
         """
         self._redis = redis_client
         self._manager = manager
-        self._command_channel = command_channel or self.DEFAULT_COMMAND_CHANNEL
-        self._result_channel = result_channel or self.DEFAULT_RESULT_CHANNEL
+        if config is None:
+            config = CommandAdapterConfig(
+                command_channel=command_channel or "channel:commands:write",
+                result_channel=result_channel or "channel:commands:result",
+            )
+        self._config = config
+        self._command_channel = self._config.command_channel
+        self._result_channel = self._config.result_channel
+        self._orchestrator = orchestrator
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -136,7 +147,7 @@ class RedisCommandAdapter:
         """是否正在運行"""
         return self._running
 
-    async def start(self) -> None:
+    async def _on_start(self) -> None:
         """
         啟動監聽
 
@@ -149,7 +160,7 @@ class RedisCommandAdapter:
         self._task = asyncio.create_task(self._listen_loop())
         logger.info(f"Redis 指令適配器已啟動: {self._command_channel}")
 
-    async def stop(self) -> None:
+    async def _on_stop(self) -> None:
         """
         停止監聽
 
@@ -193,8 +204,10 @@ class RedisCommandAdapter:
             command_data = json.loads(data)
             logger.debug(f"收到指令: {command_data}")
 
-            # 使用 ActionCommand.is_action_command 判斷指令類型
-            if ActionCommand.is_action_command(command_data):
+            # 判斷指令類型：系統指令 → 動作指令 → 寫入指令
+            if "system_command" in command_data:
+                result = await self._execute_system_command(command_data)
+            elif ActionCommand.is_action_command(command_data):
                 result = await self._execute_action(command_data)
             else:
                 result = await self._execute_write(command_data)
@@ -242,6 +255,22 @@ class RedisCommandAdapter:
 
         logger.info(f"執行 action: {command.device_id}.{command.action}, value={command.value}")
         result = await device.execute_action(command.action, **command.params)
+        if result.status != WriteStatus.SUCCESS:
+            logger.error(
+                f"Action 執行失敗: device_id={command.device_id}, action={command.action}, value={command.value}, error={result.error_message}"
+            )
+            return CommandResult(
+                command_id=command.command_id,
+                device_id=command.device_id,
+                status=result.status.value,
+                action=command.action,
+                value=command.value,
+                error_message=result.error_message,
+            )
+        else:
+            logger.info(
+                f"Action 執行成功: device_id={command.device_id}, action={command.action}, value={command.value}"
+            )
 
         return CommandResult(
             command_id=command.command_id,
@@ -251,6 +280,45 @@ class RedisCommandAdapter:
             value=command.value,
             error_message=result.error_message,
         )
+
+    async def _execute_system_command(self, data: dict[str, Any]) -> CommandResult:
+        """
+        執行系統級指令
+
+        Args:
+            data: 包含 system_command 的字典
+
+        Returns:
+            CommandResult
+        """
+        command_name = data["system_command"]
+
+        if self._orchestrator is None:
+            return CommandResult(
+                command_id=data.get("command_id", ""),
+                device_id="system",
+                status="failed",
+                action=command_name,
+                error_message="System command orchestrator is not configured",
+            )
+
+        try:
+            result = await self._orchestrator.execute(command_name)
+            return CommandResult(
+                command_id=data.get("command_id", ""),
+                device_id="system",
+                status=result.status,
+                action=command_name,
+                error_message=result.error_message,
+            )
+        except KeyError as e:
+            return CommandResult(
+                command_id=data.get("command_id", ""),
+                device_id="system",
+                status="failed",
+                action=command_name,
+                error_message=str(e),
+            )
 
     async def _execute_write(self, data: dict[str, Any]) -> CommandResult:
         """

@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger as _root_logger
 
+from .errors import AlarmError, CommunicationError, ConfigurationError, DeviceConnectionError, DeviceError
+from .health import HealthCheckable, HealthReport, HealthStatus
+from .lifecycle import AsyncLifecycleMixin
+from .resilience import CircuitBreaker, CircuitState, RetryPolicy
+
 if TYPE_CHECKING:
     from loguru import Logger
 
@@ -189,4 +194,19 @@ __all__ = [
     "set_level",
     "configure_logging",
     "logger",
+    "AsyncLifecycleMixin",
+    # Errors
+    "DeviceError",
+    "DeviceConnectionError",
+    "CommunicationError",
+    "AlarmError",
+    "ConfigurationError",
+    # Health
+    "HealthStatus",
+    "HealthReport",
+    "HealthCheckable",
+    # Resilience
+    "CircuitState",
+    "CircuitBreaker",
+    "RetryPolicy",
 ]

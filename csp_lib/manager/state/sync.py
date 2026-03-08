@@ -26,6 +26,8 @@ from csp_lib.equipment.device.events import (
     DisconnectPayload,
     ReadCompletePayload,
 )
+from csp_lib.manager.base import DeviceEventSubscriber
+from csp_lib.manager.state.config import StateSyncConfig
 
 if TYPE_CHECKING:
     from csp_lib.equipment.device import AsyncModbusDevice
@@ -34,7 +36,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class StateSyncManager:
+class StateSyncManager(DeviceEventSubscriber):
     """
     狀態同步管理器
 
@@ -71,13 +73,10 @@ class StateSyncManager:
         ```
     """
 
-    # 預設 TTL（秒）
-    DEFAULT_STATE_TTL = 60
-    DEFAULT_ONLINE_TTL = 60
-
     def __init__(
         self,
         redis_client: RedisClient,
+        config: StateSyncConfig | None = None,
         state_ttl: int | None = None,
         online_ttl: int | None = None,
     ) -> None:
@@ -86,13 +85,20 @@ class StateSyncManager:
 
         Args:
             redis_client: Redis 客戶端實例
-            state_ttl: 設備狀態 Hash TTL（秒），None 表示使用預設值
-            online_ttl: 連線狀態 TTL（秒），None 表示使用預設值
+            config: 狀態同步配置（優先使用）
+            state_ttl: 設備狀態 Hash TTL（秒），config 為 None 時使用
+            online_ttl: 連線狀態 TTL（秒），config 為 None 時使用
         """
+        super().__init__()
         self._redis = redis_client
-        self._state_ttl = state_ttl if state_ttl is not None else self.DEFAULT_STATE_TTL
-        self._online_ttl = online_ttl if online_ttl is not None else self.DEFAULT_ONLINE_TTL
-        self._unsubscribes: dict[str, list[Callable[[], None]]] = {}
+        if config is None:
+            config = StateSyncConfig(
+                state_ttl=state_ttl if state_ttl is not None else 60,
+                online_ttl=online_ttl if online_ttl is not None else 60,
+            )
+        self._config = config
+        self._state_ttl = self._config.state_ttl
+        self._online_ttl = self._config.online_ttl
 
     # ================ Key/Channel 命名 ================
 
@@ -128,45 +134,18 @@ class StateSyncManager:
 
     # ================ 訂閱管理 ================
 
-    def subscribe(self, device: AsyncModbusDevice) -> None:
-        """
-        訂閱設備事件
-
-        訂閱設備的 read_complete、connected、disconnected、
-        alarm_triggered、alarm_cleared 事件。
-        若已訂閱則不重複訂閱。
-
-        Args:
-            device: 要訂閱的 Modbus 設備
-        """
-        device_id = device.device_id
-        if device_id in self._unsubscribes:
-            return
-
-        self._unsubscribes[device_id] = [
+    def _register_events(self, device: AsyncModbusDevice) -> list[Callable[[], None]]:
+        """註冊設備的 read/連線/告警事件"""
+        logger.info(f"狀態同步管理器已訂閱設備: {device.device_id}")
+        return [
             device.on(EVENT_READ_COMPLETE, self._on_read_complete),
             device.on(EVENT_CONNECTED, self._on_connected),
             device.on(EVENT_DISCONNECTED, self._on_disconnected),
             device.on(EVENT_ALARM_TRIGGERED, self._on_alarm_triggered),
             device.on(EVENT_ALARM_CLEARED, self._on_alarm_cleared),
         ]
-        logger.info(f"狀態同步管理器已訂閱設備: {device_id}")
 
-    def unsubscribe(self, device: AsyncModbusDevice) -> None:
-        """
-        取消訂閱設備事件
-
-        移除對指定設備的事件訂閱。若尚未訂閱則不做任何操作。
-
-        Args:
-            device: 要取消訂閱的 Modbus 設備
-        """
-        device_id = device.device_id
-        if device_id not in self._unsubscribes:
-            return
-
-        for unsubscribe in self._unsubscribes.pop(device_id):
-            unsubscribe()
+    def _on_unsubscribe(self, device_id: str) -> None:
         logger.info(f"狀態同步管理器已取消訂閱設備: {device_id}")
 
     # ================ 事件處理器 ================

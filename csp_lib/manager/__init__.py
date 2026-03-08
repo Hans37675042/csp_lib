@@ -11,6 +11,7 @@
 #   - unified: 統一設備管理器
 
 from .alarm import (
+    AlarmPersistenceConfig,
     AlarmPersistenceManager,
     AlarmRecord,
     AlarmRepository,
@@ -18,9 +19,13 @@ from .alarm import (
     AlarmType,
     MongoAlarmRepository,
 )
+from .base import AsyncRepository, DeviceEventSubscriber
 from .command import (
+    ActionCommand,
+    CommandAdapterConfig,
     CommandRecord,
     CommandRepository,
+    CommandResult,
     CommandSource,
     CommandStatus,
     MongoCommandRepository,
@@ -33,11 +38,25 @@ from .device import (
     DeviceGroup,
     DeviceManager,
 )
-from .state import StateSyncManager
+from .schedule import (
+    MongoScheduleRepository,
+    ScheduleRepository,
+    ScheduleRule,
+    ScheduleService,
+    ScheduleServiceConfig,
+    ScheduleType,
+    StrategyFactory,
+    StrategyType,
+)
+from .state import StateSyncConfig, StateSyncManager
 from .unified import UnifiedConfig, UnifiedDeviceManager
 
 __all__ = [
+    # Base
+    "AsyncRepository",
+    "DeviceEventSubscriber",
     # Alarm
+    "AlarmPersistenceConfig",
     "AlarmPersistenceManager",
     "AlarmRepository",
     "MongoAlarmRepository",
@@ -45,6 +64,9 @@ __all__ = [
     "AlarmStatus",
     "AlarmType",
     # Command
+    "ActionCommand",
+    "CommandAdapterConfig",
+    "CommandResult",
     "WriteCommandManager",
     "CommandRepository",
     "MongoCommandRepository",
@@ -58,7 +80,17 @@ __all__ = [
     # Device
     "DeviceGroup",
     "DeviceManager",
+    # Schedule
+    "MongoScheduleRepository",
+    "ScheduleRepository",
+    "ScheduleRule",
+    "ScheduleService",
+    "ScheduleServiceConfig",
+    "ScheduleType",
+    "StrategyFactory",
+    "StrategyType",
     # State
+    "StateSyncConfig",
     "StateSyncManager",
     # Unified
     "UnifiedConfig",
