@@ -41,11 +41,11 @@ pip install csp0924_lib[all]        # 所有功能
 ## 架構總覽
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │                    Integration Layer                     │
 │  DeviceRegistry · ContextBuilder · CommandRouter         │
 │  GridControlLoop · SystemController                      │
-├─────────────────────────────────────────────────────────┤
+├──────────────────────────────────────────────────────────┤
 │              Manager Layer              │   Controller   │
 │  DeviceManager · AlarmPersistence       │   Strategy     │
 │  DataUpload · StateSync · Unified       │   Executor     │
@@ -57,10 +57,10 @@ pip install csp0924_lib[all]        # 所有功能
 ├─────────────────────────────────────────┴────────────────┤
 │                      Modbus Layer                        │
 │  DataTypes · Codec · Clients (TCP/RTU/Shared)            │
-├─────────────────────────────────────────────────────────┤
+├──────────────────────────────────────────────────────────┤
 │                       Core Layer                         │
 │  Logging · Lifecycle · Errors · Health                   │
-└─────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 
 附加模組: Mongo · Redis · Cluster · Monitor · Notification · Modbus Server
 ```
