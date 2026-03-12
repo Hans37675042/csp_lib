@@ -1,0 +1,19 @@
+[STUDY] 研究以下功能:
+- core
+- equipment
+- controller
+- integration
+- manager
+
+效能監控、可觀測性設計、錯誤追蹤整合等企業級需求
+
+[BUG] pop_override("bypass") 後策略未自動恢復執行
+- 問題：BypassStrategy 使用 TRIGGERED 執行模式，executor 在 bypass 期間阻塞於
+  trigger_event.wait()。pop_override 後雖然策略已切換回 CascadingStrategy（PERIODIC），
+  但 executor 仍卡在舊的 TRIGGERED wait，導致策略不執行、log 不出現。
+- 根因：set_strategy() 只換策略物件，不喚醒正在等待的 trigger_event。
+- 暫時解法：pop_override 後手動呼叫 controller.trigger() 踢出等待。
+- 建議修正：set_strategy() 或 pop_override() 應自動判斷舊策略為 TRIGGERED 模式時，
+  主動 set trigger_event 以喚醒 executor。
+- 相關檔案：csp_lib/controller/executor/strategy_executor.py
+            csp_lib/integration/system_controller.py
