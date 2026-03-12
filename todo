@@ -5,7 +5,7 @@
 - integration
 - manager
 
-效能監控、可觀測性設計、錯誤追蹤整合等企業級需求
+[TODO] 效能監控、可觀測性設計、錯誤追蹤整合等企業級需求
 
 [BUG] pop_override("bypass") 後策略未自動恢復執行
 - 問題：BypassStrategy 使用 TRIGGERED 執行模式，executor 在 bypass 期間阻塞於
