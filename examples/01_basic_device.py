@@ -32,7 +32,7 @@ from csp_lib.equipment.core import (
 )
 from csp_lib.equipment.core.point import PointMetadata, RangeValidator
 from csp_lib.equipment.device import AsyncModbusDevice, DeviceConfig
-from csp_lib.modbus import Float32, ModbusTcpConfig, PymodbusTcpClient, UInt16
+from csp_lib.modbus import Float32, ModbusTcpConfig, PymodbusTcpClient, UInt16, FunctionCode
 
 # ============================================================
 # Step 1: Define Read Points (設備讀取點位)
@@ -45,6 +45,7 @@ active_power = ReadPoint(
     data_type=Float32(),
     pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)),
     metadata=PointMetadata(unit="kW", description="Active power output"),
+    function_code=FunctionCode.READ_INPUT_REGISTERS,
 )
 
 # Battery SOC: register 5034, UInt16, scale ×0.1 to get percentage
@@ -54,6 +55,7 @@ soc = ReadPoint(
     data_type=UInt16(),
     pipeline=pipeline(ScaleTransform(0.1)),
     metadata=PointMetadata(unit="%", description="Battery state of charge"),
+    function_code=FunctionCode.READ_INPUT_REGISTERS,
 )
 
 # Fault code: register 5100, UInt16, raw bitmask
@@ -65,6 +67,7 @@ fault_code = ReadPoint(
         description="Fault code bitmask",
         value_map={0: "Normal", 1: "Over-temperature", 2: "Over-current", 4: "DC fault"},
     ),
+    function_code=FunctionCode.READ_INPUT_REGISTERS,
 )
 
 # ============================================================
@@ -116,6 +119,13 @@ soc_evaluator = ThresholdAlarmEvaluator(
             operator=Operator.LT,
             value=10.0,
         ),
+        ThresholdCondition(
+            alarm=AlarmDefinition(
+                code="SOC_HIGH", name="SOC High", level=AlarmLevel.WARNING, description="SOC above 90%"
+            ),
+            operator=Operator.GT,
+            value=90.0,
+        ),
     ],
 )
 
@@ -126,7 +136,7 @@ soc_evaluator = ThresholdAlarmEvaluator(
 
 async def main():
     # Modbus TCP client
-    client = PymodbusTcpClient(ModbusTcpConfig(host="192.168.1.100", port=502))
+    client = PymodbusTcpClient(ModbusTcpConfig(host="127.0.0.1", port=5020))
 
     # Device configuration
     config = DeviceConfig(
@@ -178,17 +188,24 @@ async def main():
     async with device:
         # Device is connected and read loop is running.
         # latest_values is updated every read_interval.
-
+        
         print(f"Connected: {device.is_connected}")
         print(f"Responsive: {device.is_responsive}")
-        print(f"Latest values: {device.latest_values}")
 
-        # Write a power setpoint
-        result = await device.write("p_set", 50.0, verify=True)
-        print(f"Write result: {result.status.value}")
+        p = 0
+        while True:
+            await asyncio.sleep(1)
+            p += 1
+            if p > 10:
+                p = -10  # Ramp up and down
+            print(f"Latest values: {device.latest_values}")
+
+            # Write a power setpoint
+            result = await device.write("p_set", p, verify=True)
+            print(f"Write result: {result.status.value}")
 
         # Let it run for 10 seconds
-        await asyncio.sleep(10)
+        # await asyncio.sleep(10)
 
     # After exiting: device is stopped and disconnected.
 
