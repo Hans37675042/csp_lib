@@ -7,6 +7,17 @@
 
 [TODO] 效能監控、可觀測性設計、錯誤追蹤整合等企業級需求
 
+[IMPROVE] PFAdjustmentStrategy PID 防護建議
+- 問題1：Derivative Kick — on_activate() 後 _prev_error=0，首次執行若誤差大，
+  D 項會產生 Kd*error/dt 脈衝，造成輸出突跳。
+- 建議1：改用 Derivative-on-Measurement，對 current_pf 求導而非對 error：
+  d_term = -kd * (current_pf - prev_pf) / dt
+- 問題2：積分 Windup — q_output 有 clamp 但 _integral 仍無限累積，
+  解除 clamp 後輸出突衝。
+- 建議2：加入 anti-windup，當輸出飽和時停止積分累積：
+  if q_min < q_output < q_max: self._integral += error * dt
+- 相關檔案：examples/06_custom_strategy.py（PFAdjustmentStrategy.execute）
+
 [BUG] pop_override("bypass") 後策略未自動恢復執行
 - 問題：BypassStrategy 使用 TRIGGERED 執行模式，executor 在 bypass 期間阻塞於
   trigger_event.wait()。pop_override 後雖然策略已切換回 CascadingStrategy（PERIODIC），
