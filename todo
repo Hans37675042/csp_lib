@@ -18,7 +18,27 @@
   if q_min < q_output < q_max: self._integral += error * dt
 - 相關檔案：examples/06_custom_strategy.py（PFAdjustmentStrategy.execute）
 
-[BUG] pop_override("bypass") 後策略未自動恢復執行
+[BUG] 09_advanced_strategies.py Section A 場景 1 錯誤觸發 ReversePowerProtection
+- 問題：場景 1 標註「無保護觸發」，但實際 p_target=200kW > meter_power+threshold=100+0=100kW，
+  ReversePowerProtection 會將 p_target 截斷至 100kW。
+- 根因：範例參數不一致，p_target 超過電表負載上限，零容忍逆送保護必然介入。
+- 建議修正（二擇一）：
+  1. 降低放電指令：Command(p_target=80.0, q_target=50.0)
+  2. 提高電表負載：extra={"meter_power": 300.0, "system_alarm": False}
+- 相關檔案：examples/09_advanced_strategies.py（demo_protection_rules 場景 1）
+            csp_lib/controller/system/protection.py（ReversePowerProtection.evaluate）
+
+[BUG] 09_advanced_strategies.py Section D demo_mode_manager 直接呼叫具名策略實例執行 command
+- 問題：Section D 原始範例在計算 command 時直接選擇具名策略實例呼叫
+  （如 pq_strategy.execute(context)、stop_strategy.execute(context)），
+  而非透過 mode_manager 取得當前有效策略再執行。
+- 根因：呼叫端自行決定要執行哪個策略，繞過 ModeManager 的策略調度邏輯，
+  導致即使有更高優先級的 override 生效，仍可能計算到錯誤的策略輸出。
+- 修正後：改為 mode_manager.effective_strategy.execute(context)，
+  由 ModeManager 決定當前生效策略，呼叫端不應自行選擇策略進行計算。
+- 相關檔案：examples/09_advanced_strategies.py（demo_mode_manager，Step 1、Step 2 的 command 取得）
+
+[BUG][reported] pop_override("bypass") 後策略未自動恢復執行
 - 問題：BypassStrategy 使用 TRIGGERED 執行模式，executor 在 bypass 期間阻塞於
   trigger_event.wait()。pop_override 後雖然策略已切換回 CascadingStrategy（PERIODIC），
   但 executor 仍卡在舊的 TRIGGERED wait，導致策略不執行、log 不出現。
