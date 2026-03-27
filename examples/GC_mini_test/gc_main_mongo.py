@@ -41,6 +41,7 @@ from csp_lib.mongo import MongoBatchUploader, MongoConfig, UploaderConfig, creat
 
 logger = get_logger("gc_mini_test")
 set_level("info")
+set_level("DEBUG", "gc_mini_test")  # 調整為 DEBUG 級別以查看詳細上傳流程
 
 # ============================================================
 # MongoDB 連線設定（請依實際環境修改）

@@ -2,21 +2,17 @@
 from dataclasses import dataclass
 from typing import Any, Optional
 import asyncio, time
-from math import ceil
 from influxdb_client_3 import InfluxDBClient3
 
-from csp_lib.core import get_logger
+from csp_lib.core import get_logger, set_level
 from csp_lib.mongo import MongoBatchUploader
-from csp_lib.manager.unified import UnifiedConfig, UnifiedDeviceManager
-from csp_lib.manager.data import DataUploadManager as DU
-from csp_lib.equipment.device import AsyncModbusDevice
 from csp_lib.mongo.config import UploaderConfig
 from csp_lib.mongo.queue import BatchQueue
-
-
+from csp_lib.equipment.device import AsyncModbusDevice
+from csp_lib.manager.data import DataUploadManager as DU
+from csp_lib.manager.unified import UnifiedConfig, UnifiedDeviceManager
 
 logger = get_logger("gc_mini_test")
-
 
 @dataclass
 class WriteResult:
@@ -29,35 +25,25 @@ class influxWriter():
         self._influx_db = influx_db
 
     async def write_batch(self, collection_name: str, documents: list[dict[str, Any]]) -> WriteResult:
-        
         if not documents:
             return WriteResult(success=True, inserted_count=0)
-
         try:
-            logger.info(f"InfluxWriter: 寫入 {len(documents)} 筆至 '{collection_name}'")
-            inserted_count = 0
-            
+            logger.debug(f"InfluxWriter: 寫入 {len(documents)} 筆至 '{collection_name}'")
             records = []
             for doc in documents:
                 time = doc.pop("timestamp")
-                inserted_count += 1
                 record = {"measurement": collection_name, "fields": doc, "time": time}
                 records.append(record)
 
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda:self._influx_db.write(records, "demo"))
-            # self._influx_db.write(record=records, database="demo")
-            
-
-            logger.info(f"InfluxWriter: 成功寫入 {inserted_count} 筆至 '{collection_name}'")
-            return WriteResult(success=True, inserted_count=inserted_count)
+            logger.debug(f"InfluxWriter: 成功寫入 {len(records)} 筆至 '{collection_name}'")
+            return WriteResult(success=True, inserted_count=len(records))
 
         except Exception as e:
             error_msg = f"寫入 '{collection_name}' 失敗: {e}"
             logger.error(f"InfluxWriter: {error_msg}")
             return WriteResult(success=False, error_message=error_msg)
-
-
 
 class InfluxBatchUploader(MongoBatchUploader):
     def __init__(self, influx_db: InfluxDBClient3, config: Optional[UploaderConfig] = None) -> None:
@@ -72,7 +58,7 @@ class InfluxBatchUploader(MongoBatchUploader):
     async def enqueue(self, collection_name: str, document: dict[str, Any]) -> None:
         await super().enqueue(collection_name, document)  # 確保 queue 存在
         if self._queues[collection_name].size_sync() >= self._config.batch_size_threshold:
-            logger.info(f"InfluxBatchUploader: '{collection_name}' size: {self._queues[collection_name].size_sync()}達到批次閾值:{self._config.batch_size_threshold}，觸發立即上傳")
+            logger.debug(f"InfluxBatchUploader: '{collection_name}' size: {self._queues[collection_name].size_sync()}達到批次閾值:{self._config.batch_size_threshold}，觸發立即上傳")
             self._flush_event.set()  # 觸發立即 flush
     
     async def _flush_loop(self) -> None:
@@ -138,11 +124,11 @@ class dualDBUnifiedDeviceManager(UnifiedDeviceManager):
         self._data_manager_influx: DataUploadManager | None = (
             DataUploadManager(config.influx_uploader) if config.influx_uploader else None
         )
-        logger.info(
+        logger.debug(
             f"UnifiedDeviceManager 初始化: "
             f"alarm={self._alarm_manager is not None}, "
             f"command={self._command_manager is not None}, "
-            f"data_db={self._data_manager is not None}, "
+            f"data_mongo={self._data_manager is not None}, "
             f"data_influx={self._data_manager_influx is not None}, "
             f"state={self._state_manager is not None}, "
             f"statistics={self._statistics_manager is not None}"
