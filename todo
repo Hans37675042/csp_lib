@@ -56,13 +56,16 @@
 - 相關檔案：csp_lib/mongo/uploader.py（_flush_loop）
   已修正於：examples/GC_mini_test/influx_lib.py（InfluxBatchUploader._flush_loop）
 
-[BUG][reported] pop_override("bypass") 後策略未自動恢復執行
-- 問題：BypassStrategy 使用 TRIGGERED 執行模式，executor 在 bypass 期間阻塞於
-  trigger_event.wait()。pop_override 後雖然策略已切換回 CascadingStrategy（PERIODIC），
-  但 executor 仍卡在舊的 TRIGGERED wait，導致策略不執行、log 不出現。
-- 根因：set_strategy() 只換策略物件，不喚醒正在等待的 trigger_event。
-- 暫時解法：pop_override 後手動呼叫 controller.trigger() 踢出等待。
-- 建議修正：set_strategy() 或 pop_override() 應自動判斷舊策略為 TRIGGERED 模式時，
-  主動 set trigger_event 以喚醒 executor。
-- 相關檔案：csp_lib/controller/executor/strategy_executor.py
-            csp_lib/integration/system_controller.py
+[BUG] base.py 可能有問題 未使用 async def
+    def _handle_read_failure(self, error_msg: str) -> None:
+        """處理讀取失敗：累加計數 + 記錄失敗時間 + 發送錯誤事件"""
+        self._consecutive_failures += 1
+        self._last_failure_time = time.monotonic()
+        self._emitter.emit(
+            EVENT_READ_ERROR,
+            ReadErrorPayload(
+                device_id=self._config.device_id,
+                error=error_msg,
+                consecutive_failures=self._consecutive_failures,
+            ),
+        )
