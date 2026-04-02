@@ -7,9 +7,14 @@ from csp_lib.equipment.alarm import (
     Operator,
     AlarmLevel
 )
+from csp_lib.equipment.core.transform import BitExtractTransform
+from csp_lib.equipment.core.pipeline import ProcessingPipeline
+from csp_lib.equipment.core import pipeline, ReadPoint, WritePoint, RoundTransform, ScaleTransform
+from csp_lib.equipment.device import AsyncModbusDevice
 
 from csp_lib.modbus import Float32, UInt16, UInt32, FunctionCode
 
+from csp_lib.integration import CommandStep, StepCheck, SystemCommand
 
 
 # ============================================================
@@ -29,11 +34,31 @@ active_power = ReadPoint(
 # Battery SOC: register 5034, UInt16, scale ×0.1 to get percentage
 soc = ReadPoint(
     name="soc",
-    address=5034,
+    address=5002,
     data_type=UInt16(),
     pipeline=pipeline(ScaleTransform(0.1)),
     metadata=PointMetadata(unit="%", description="Battery state of charge"),
     function_code=FunctionCode.READ_INPUT_REGISTERS,
+)
+
+bms_on = ReadPoint(
+    name="bms_on",
+    address=5004,
+    data_type=UInt16(),
+    metadata=PointMetadata(description="BMS 開機狀態"),
+    function_code=FunctionCode.READ_INPUT_REGISTERS,
+    pipeline=ProcessingPipeline(steps=[BitExtractTransform(bit_offset=0)]),
+    # 輸出: bool
+)
+
+pcs_on = ReadPoint(
+    name="pcs_on",
+    address=5004,
+    data_type=UInt16(),
+    metadata=PointMetadata(description="PCS 開機狀態"),
+    function_code=FunctionCode.READ_INPUT_REGISTERS,
+    pipeline=ProcessingPipeline(steps=[BitExtractTransform(bit_offset=1)]),
+    # 輸出: bool
 )
 
 # Fault code: register 5100, UInt16, raw bitmask
@@ -70,12 +95,28 @@ q_set = WritePoint(
     metadata=PointMetadata(unit="kVar", description="Reactive power setpoint"),
 )
 
-switch = WritePoint(
+BMS_switch = WritePoint(
     name="BMS_on_off",
     address=6004,
     data_type=UInt16(),
     validator=RangeValidator(min_value=0, max_value=1),
     metadata=PointMetadata(description="BMS on/off switch (0=off, 1=on)"),
+)
+
+PCS_switch = WritePoint(
+    name="PCS_on_off",
+    address=6006,
+    data_type=UInt16(),
+    validator=RangeValidator(min_value=0, max_value=1),
+    metadata=PointMetadata(description="PCS on/off switch (0=off, 1=on)"),
+)
+
+HeartBeat = WritePoint(
+    name="heartbeat",
+    address=6008,
+    data_type=Float32(),
+    validator=RangeValidator(min_value=0, max_value=255),
+    metadata=PointMetadata(description="Heartbeat signal"),
 )
 
 # ============================================================
@@ -115,6 +156,109 @@ soc_evaluator = ThresholdAlarmEvaluator(
     ],
 )
 
-pcs_always_points = [active_power, soc, fault_code]
-pcs_write_points = [p_set, q_set, switch]
+pcs_always_points = [active_power, soc, bms_on, pcs_on, fault_code]
+pcs_write_points = [p_set, q_set, BMS_switch, PCS_switch, HeartBeat]
 pcs_alarm_evaluators = [fault_evaluator, soc_evaluator]
+
+class PCSDevice(AsyncModbusDevice):
+    ACTIONS: dict[str, str] = {
+        "dummy_action": "_action_dummy",  # 範例用的虛擬指令
+        "pcs_power_on": "_action_pcs_power_on",
+        "bms_power_on": "_action_bms_power_on",
+        "power_off": "_action_power_off",
+    }
+
+    @property
+    def is_bms_on(self) -> bool:
+        return bool(self.latest_values.get("bms_on", 0))
+    
+    @property
+    def is_bms_off(self) -> bool:
+        return not self.is_bms_on
+
+    @property
+    def is_pcs_on(self) -> bool:
+        return bool(self.latest_values.get("pcs_on", 0))
+    
+    @property
+    def is_pcs_off(self) -> bool:
+        return not self.is_pcs_on
+
+    async def _action_dummy(self):
+        None
+
+    async def _action_pcs_power_on(self):
+        await self.write("PCS_on_off", 1, verify=True)
+        
+    async def _action_bms_power_on(self):
+        await self.write("BMS_on_off", 1, verify=True)
+
+    async def _action_power_off(self):
+        await self.write("PCS_on_off", 0, verify=True)
+        await self.write("BMS_on_off", 0, verify=True)
+
+startup_cmd = SystemCommand(
+    name="startup_sequence",
+    description="完整啟動: 待機 -> 驗證 -> 充電",
+    steps=[
+        CommandStep(
+            action="dummy_action",
+            trait="pcs",
+            description="檢查 PCS 響應",
+            check_after=StepCheck(
+                trait="pcs",
+                check="is_responsive",
+                timeout=5.0,
+                poll_interval=0.5,
+            )
+        ),
+        CommandStep(
+            action="power_off",
+            trait="pcs",
+            description="關閉PCS",
+            delay_before=0.5,
+            check_after=StepCheck(
+                trait="pcs",
+                check="is_pcs_off",
+                timeout=3.0,
+                poll_interval=0.5,
+            )
+        ),
+        CommandStep(
+            action="dummy_action",
+            trait="pcs",
+            description="關閉BMS",
+            delay_before=0.5,
+            check_after=StepCheck(
+                trait="pcs",
+                check="is_bms_off",
+                timeout=3.0,
+                poll_interval=0.5,
+            )
+        ),
+        CommandStep(
+            action="bms_power_on",
+            trait="pcs",
+            description="開啟BMS",
+            delay_before=0.5,
+            check_after=StepCheck(
+                trait="pcs",
+                check="is_bms_on",
+                timeout=10.0,
+                poll_interval=0.5,
+            )
+        ),
+        CommandStep(
+            action="pcs_power_on",
+            trait="pcs",
+            description="開啟PCS",
+            delay_before=0.5,
+            check_after=StepCheck(
+                trait="pcs",
+                check="is_pcs_on",
+                timeout=10.0,
+                poll_interval=0.5,
+            )
+        )
+    ],
+)
