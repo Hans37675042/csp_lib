@@ -13,10 +13,20 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger as _root_logger
 
-from .errors import AlarmError, CommunicationError, ConfigurationError, DeviceConnectionError, DeviceError
+from .errors import (
+    AlarmError,
+    CommunicationError,
+    ConfigurationError,
+    DeviceConnectionError,
+    DeviceError,
+    DeviceRegistryError,
+    ProtectionError,
+    StrategyExecutionError,
+)
 from .health import HealthCheckable, HealthReport, HealthStatus
 from .lifecycle import AsyncLifecycleMixin
 from .resilience import CircuitBreaker, CircuitState, RetryPolicy
+from .runtime_params import RuntimeParameters
 
 if TYPE_CHECKING:
     from loguru import Logger
@@ -201,6 +211,9 @@ __all__ = [
     "CommunicationError",
     "AlarmError",
     "ConfigurationError",
+    "StrategyExecutionError",
+    "ProtectionError",
+    "DeviceRegistryError",
     # Health
     "HealthStatus",
     "HealthReport",
@@ -209,4 +222,6 @@ __all__ = [
     "CircuitState",
     "CircuitBreaker",
     "RetryPolicy",
+    # Runtime Parameters
+    "RuntimeParameters",
 ]
