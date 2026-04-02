@@ -12,6 +12,16 @@ from csp_lib.equipment.device import AsyncModbusDevice
 from csp_lib.manager.data import DataUploadManager as DU
 from csp_lib.manager.unified import UnifiedConfig, UnifiedDeviceManager
 
+from typing import TYPE_CHECKING, Any, Callable
+
+from csp_lib.core import get_logger
+from csp_lib.equipment.device.events import (
+    EVENT_DISCONNECTED,
+    EVENT_READ_COMPLETE,
+    EVENT_READ_ERROR,
+    ReadErrorPayload
+    )
+
 logger = get_logger("gc_mini_test")
 
 @dataclass
@@ -113,6 +123,52 @@ class InfluxBatchUploader(MongoBatchUploader):
 class DataUploadManager(DU):
     def __init__(self, uploader: MongoBatchUploader | InfluxBatchUploader) -> None:
         super().__init__(uploader)
+        self._is_disconnect = False
+
+    def _register_events(self, device: AsyncModbusDevice) -> list[Callable[[], None]]:
+        """註冊設備的 read_complete 與 disconnected 事件"""
+        return [
+            device.on(EVENT_READ_COMPLETE, self._on_read_complete),
+            device.on(EVENT_READ_ERROR, self._on_read_error),
+            device.on(EVENT_DISCONNECTED, self._on_disconnected),
+        ]
+    
+    async def _on_read_complete(self, payload):
+        self._is_disconnect = False
+        await super()._on_read_complete(payload)
+
+    async def _on_read_error(self, payload: ReadErrorPayload) -> None:
+        """
+        處理讀取失敗事件
+        """
+        if self._is_disconnect:
+            return
+
+        device_id = payload.device_id
+        collection_name = self._device_collection.get(device_id)
+        if not collection_name:
+            return
+
+        # 降頻檢查
+        interval = self._save_intervals.get(device_id)
+        if interval is not None:
+            now = time.monotonic()
+            last_save = self._last_save_times.get(device_id)
+            if last_save is not None and (now - last_save) < interval:
+                return
+            self._last_save_times[device_id] = now
+
+        # 建立文件並上傳
+        document = {
+            "device_id": device_id,
+            "timestamp": payload.timestamp,
+            **self._last_values[device_id],
+        }
+        await self._uploader.enqueue(collection_name, document)
+
+    async def _on_disconnected(self, payload) -> None:
+        self._is_disconnect = True
+        await super()._on_disconnected(payload)
 
 @dataclass
 class dualDBUnifiedConfig(UnifiedConfig):
