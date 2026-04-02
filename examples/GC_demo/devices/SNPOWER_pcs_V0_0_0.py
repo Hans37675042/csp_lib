@@ -1,0 +1,64 @@
+from csp_lib.modbus import ByteOrder, FunctionCode, UInt16, Int16, UInt32, Int32
+from csp_lib.equipment.core import (
+    ReadPoint,
+    RoundTransform,
+    ScaleTransform,
+    WritePoint,
+    pipeline,
+)
+from csp_lib.equipment.core.point import PointMetadata, RangeValidator, EnumValidator
+
+
+SNPOWER_pcs_read_points = [
+    ReadPoint(name="vl_ab", address=0, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="V", description="A-B線電壓")),
+    ReadPoint(name="vl_bc", address=1, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="V", description="B-C線電壓")),
+    ReadPoint(name="vl_ca", address=2, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="V", description="C-A線電壓")),
+    ReadPoint(name="f", address=3, data_type=Int32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.001), RoundTransform(3)), metadata=PointMetadata(unit="Hz", description="頻率")),
+    ReadPoint(name="i_a", address=5, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="A", description="A相電流")),
+    ReadPoint(name="i_b", address=6, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="A", description="B相電流")),
+    ReadPoint(name="i_c", address=7, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="A", description="C相電流")),
+    ReadPoint(name="p", address=8, data_type=Int32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kW", description="總實功功率")),
+    ReadPoint(name="q", address=10, data_type=Int32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kVAR", description="總虛功功率")),
+    ReadPoint(name="s", address=12, data_type=Int32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kVA", description="總視在功率")),
+    ReadPoint(name="pf", address=14, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.001), RoundTransform(3)), metadata=PointMetadata(unit="", description="功率因數")),
+    ReadPoint(name="v_battery", address=15, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(unit="Vdc", description="電池電壓")),
+    ReadPoint(name="i_battery", address=16, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="A", description="電池電流")),
+    ReadPoint(name="p_battery", address=17, data_type=Int32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kW", description="電池功率")),
+    ReadPoint(name="temp_IGBT", address=19, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="℃", description="IGBT溫度")),
+    ReadPoint(name="temp_area", address=20, data_type=Int16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="℃", description="環境溫度")),
+    ReadPoint(name="available_kva", address=21, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kVA", description="當前可用容量")),
+    ReadPoint(name="tot_charge_kwh", address=1150, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kWH", description="總充電量")),
+    ReadPoint(name="tot_discharge_kwh", address=1152, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kWH", description="總放電量")),
+    ReadPoint(name="tot_charge_time", address=1158, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="hr", description="總充電時長")),
+    ReadPoint(name="tot_discharge_time", address=1160, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="hr", description="總放電時長")),
+    ReadPoint(name="daily_charge_kwh", address=1154, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kWH", description="日充電量")),
+    ReadPoint(name="daily_discharge_kwh", address=1156, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="kWH", description="日放電量")),
+    ReadPoint(name="daily_charge_time", address=1162, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="hr", description="日充電時長")),
+    ReadPoint(name="daily_discharge_time", address=1164, data_type=UInt32(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)), metadata=PointMetadata(unit="hr", description="日放電時長")),
+    ReadPoint(name="alarm1", address=750, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 1")),
+    ReadPoint(name="alarm2", address=751, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 2")),
+    ReadPoint(name="alarm3", address=753, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 3")),
+    ReadPoint(name="alarm4", address=755, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 4")),
+    ReadPoint(name="alarm5", address=757, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 5")),
+    ReadPoint(name="alarm6", address=759, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 6")),
+    ReadPoint(name="alarm7", address=760, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 7")),
+    ReadPoint(name="alarm8", address=761, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 8")),
+    ReadPoint(name="alarm9", address=767, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 9")),
+    ReadPoint(name="alarm10", address=769, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 10")),
+    ReadPoint(name="alarm11", address=771, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 11")),
+    ReadPoint(name="alarm12", address=772, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 12")),
+    ReadPoint(name="alarm13", address=950, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 13")),
+    ReadPoint(name="alarm14", address=951, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 14")),
+    ReadPoint(name="alarm15", address=952, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="Alarm Status 15")),
+    ReadPoint(name="mode1", address=850, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="運轉狀態1")),
+    ReadPoint(name="mode2", address=852, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="運轉狀態2")),
+    ReadPoint(name="mode3", address=855, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="運轉狀態3")),
+    ReadPoint(name="mode4", address=1050, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="運轉狀態4")),
+    ReadPoint(name="mode5", address=1051, data_type=UInt16(), function_code=FunctionCode.READ_HOLDING_REGISTERS, byte_order=ByteOrder.BIG_ENDIAN, pipeline=pipeline(ScaleTransform(1), RoundTransform(0)), metadata=PointMetadata(description="運轉狀態5")),
+]
+
+SNPOWER_pcs_write_points = [
+    WritePoint(name="PQ_p_ref", address=13200, data_type=Int16(), function_code=FunctionCode.WRITE_SINGLE_REGISTER, validator=RangeValidator(min_value=-2400, max_value=2400), pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1))),
+    WritePoint(name="PQ_q_ref", address=13201, data_type=Int16(), function_code=FunctionCode.WRITE_SINGLE_REGISTER, validator=RangeValidator(min_value=-2400, max_value=2400), pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1))),
+    WritePoint(name="PCS_on_off", address=5500, data_type=UInt16(), function_code=FunctionCode.WRITE_SINGLE_REGISTER, validator=EnumValidator((0xFF00, 0x0000)), pipeline=pipeline(ScaleTransform(1), RoundTransform(0)))
+]
