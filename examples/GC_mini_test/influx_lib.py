@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 import asyncio, time
 from influxdb_client_3 import InfluxDBClient3
+from math import ceil
 
 from csp_lib.core import get_logger, set_level
 from csp_lib.mongo import MongoBatchUploader
@@ -79,14 +80,11 @@ class InfluxBatchUploader(MongoBatchUploader):
                 stop_task = asyncio.ensure_future(self._stop_event.wait())
                 flush_task = asyncio.ensure_future(self._flush_event.wait())
 
-                loop_time = time.monotonic()
-                next_time += self._config.flush_interval
-                if next_time > loop_time:
-                    timeout = next_time - loop_time
-                else:
-                    while next_time < loop_time:
-                        next_time += self._config.flush_interval
-                    timeout = 0
+                current_time = time.monotonic()
+                d_time = current_time - next_time
+                n_intervals = ceil(d_time / self._config.flush_interval)
+                next_time += n_intervals * self._config.flush_interval
+                timeout = next_time - current_time
 
                 done, pending = await asyncio.wait(
                     [stop_task, flush_task],
