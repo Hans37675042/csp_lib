@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from csp_lib.controller.core import Command, StrategyContext, SystemBase
 from csp_lib.core import get_logger
@@ -17,7 +17,10 @@ from csp_lib.core import get_logger
 from .registry import DeviceRegistry
 from .schema import AggregateFunc, CapabilityContextMapping, ContextMapping
 
-logger = get_logger("csp_lib.integration.context_builder")
+if TYPE_CHECKING:
+    from csp_lib.core.runtime_params import RuntimeParameters
+
+logger = get_logger(__name__)
 
 
 def apply_builtin_aggregate(func: AggregateFunc, values: list[Any]) -> Any:
@@ -68,6 +71,7 @@ class ContextBuilder:
         mappings: list[ContextMapping],
         system_base: SystemBase | None = None,
         capability_mappings: list[CapabilityContextMapping] | None = None,
+        runtime_params: RuntimeParameters | None = None,
     ) -> None:
         """
         初始化建構器
@@ -77,11 +81,13 @@ class ContextBuilder:
             mappings: 設備點位 → context 欄位的映射列表
             system_base: 系統基準值（可選），設定於 context.system_base
             capability_mappings: capability-driven context 映射列表（可選）
+            runtime_params: 系統參數（可選），直接引用掛到 context.params
         """
         self._registry = registry
         self._mappings = mappings
         self._system_base = system_base
         self._capability_mappings = capability_mappings or []
+        self._runtime_params = runtime_params
 
     def build(self) -> StrategyContext:
         """
@@ -95,6 +101,7 @@ class ContextBuilder:
         ctx = StrategyContext(
             last_command=Command(),
             system_base=self._system_base,
+            params=self._runtime_params,
         )
 
         for mapping in self._mappings:
@@ -129,8 +136,13 @@ class ContextBuilder:
         if mapping.transform is not None:
             try:
                 raw = mapping.transform(raw)
-            except Exception:
-                logger.warning(f"Transform failed for mapping '{mapping.context_field}', using default.")
+            except Exception as e:
+                source = mapping.device_id or f"trait:{mapping.trait}"
+                transform_name = getattr(mapping.transform, "__name__", str(mapping.transform))
+                logger.warning(
+                    f"Transform failed: {source}.{mapping.point_name} → {mapping.context_field} "
+                    f"(transform={transform_name}): {e}"
+                )
                 return mapping.default
 
         return raw
@@ -170,8 +182,13 @@ class ContextBuilder:
         if mapping.custom_aggregate is not None:
             try:
                 return mapping.custom_aggregate(values)
-            except Exception:
-                logger.warning(f"Custom aggregate failed for mapping '{mapping.context_field}', using default.")
+            except Exception as e:
+                source = mapping.device_id or f"trait:{mapping.trait}"
+                agg_name = getattr(mapping.custom_aggregate, "__name__", str(mapping.custom_aggregate))
+                logger.warning(
+                    f"Custom aggregate failed: {source}.{mapping.point_name} → {mapping.context_field} "
+                    f"(aggregate={agg_name}): {e}"
+                )
                 return None
 
         return apply_builtin_aggregate(mapping.aggregate, values)
@@ -191,8 +208,13 @@ class ContextBuilder:
         if mapping.transform is not None:
             try:
                 raw = mapping.transform(raw)
-            except Exception:
-                logger.warning(f"Transform failed for capability mapping '{mapping.context_field}', using default.")
+            except Exception as e:
+                source = mapping.device_id or (f"trait:{mapping.trait}" if mapping.trait else "auto")
+                transform_name = getattr(mapping.transform, "__name__", str(mapping.transform))
+                logger.warning(
+                    f"Capability transform failed: {source} [{mapping.capability.name}:{mapping.slot}] "
+                    f"→ {mapping.context_field} (transform={transform_name}): {e}"
+                )
                 return mapping.default
 
         return raw
@@ -237,9 +259,12 @@ class ContextBuilder:
         if mapping.custom_aggregate is not None:
             try:
                 return mapping.custom_aggregate(values)
-            except Exception:
+            except Exception as e:
+                source = mapping.device_id or (f"trait:{mapping.trait}" if mapping.trait else "auto")
+                agg_name = getattr(mapping.custom_aggregate, "__name__", str(mapping.custom_aggregate))
                 logger.warning(
-                    f"Custom aggregate failed for capability mapping '{mapping.context_field}', using default."
+                    f"Capability aggregate failed: {source} [{mapping.capability.name}:{mapping.slot}] "
+                    f"→ {mapping.context_field} (aggregate={agg_name}): {e}"
                 )
                 return None
 
