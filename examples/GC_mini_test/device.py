@@ -31,10 +31,20 @@ active_power = ReadPoint(
     function_code=FunctionCode.READ_INPUT_REGISTERS,
 )
 
+# Grid frequency: register 5002, Float32, scale ×0.1 then round to 1 decimal
+frequency = ReadPoint(
+    name="frequency",
+    address=5002,
+    data_type=Float32(),
+    pipeline=pipeline(ScaleTransform(0.1), RoundTransform(1)),
+    metadata=PointMetadata(unit="Hz", description="Grid frequency"),
+    function_code=FunctionCode.READ_INPUT_REGISTERS,
+)
+
 # Battery SOC: register 5034, UInt16, scale ×0.1 to get percentage
 soc = ReadPoint(
     name="soc",
-    address=5002,
+    address=5004,
     data_type=UInt16(),
     pipeline=pipeline(ScaleTransform(0.1)),
     metadata=PointMetadata(unit="%", description="Battery state of charge"),
@@ -43,7 +53,7 @@ soc = ReadPoint(
 
 bms_on = ReadPoint(
     name="bms_on",
-    address=5004,
+    address=5006,
     data_type=UInt16(),
     metadata=PointMetadata(description="BMS 開機狀態"),
     function_code=FunctionCode.READ_INPUT_REGISTERS,
@@ -53,7 +63,7 @@ bms_on = ReadPoint(
 
 pcs_on = ReadPoint(
     name="pcs_on",
-    address=5004,
+    address=5006,
     data_type=UInt16(),
     metadata=PointMetadata(description="PCS 開機狀態"),
     function_code=FunctionCode.READ_INPUT_REGISTERS,
@@ -156,7 +166,7 @@ soc_evaluator = ThresholdAlarmEvaluator(
     ],
 )
 
-pcs_always_points = [active_power, soc, bms_on, pcs_on, fault_code]
+pcs_always_points = [active_power, frequency, soc, bms_on, pcs_on, fault_code]
 pcs_write_points = [p_set, q_set, BMS_switch, PCS_switch, HeartBeat]
 pcs_alarm_evaluators = [fault_evaluator, soc_evaluator]
 
