@@ -69,3 +69,5 @@
                 consecutive_failures=self._consecutive_failures,
             ),
         )
+
+[BUG] DB timestamp 時間地區不對
