@@ -25,14 +25,19 @@
 
 import asyncio
 import os
+from datetime import datetime
 from device import *
 from influx_lib import dualDBUnifiedConfig, dualDBUnifiedDeviceManager, InfluxBatchUploader
 from influxdb_client_3 import InfluxDBClient3
+from dataclasses import dataclass, field
+from typing import Any
 
+from csp_lib.mongo import MongoBatchUploader, MongoConfig, UploaderConfig, create_mongo_client
+from csp_lib.modbus import ModbusTcpConfig, PymodbusTcpClient
 from csp_lib.core import get_logger, set_level
 from csp_lib.equipment.device import DeviceConfig
-from csp_lib.modbus import ModbusTcpConfig, PymodbusTcpClient
-from csp_lib.mongo import MongoBatchUploader, MongoConfig, UploaderConfig, create_mongo_client
+from csp_lib.equipment.processing import AggregatorPipeline
+
 from csp_lib.controller.system import SOCProtection, SOCProtectionConfig
 from csp_lib.controller.core import Command, SystemBase
 from csp_lib.controller.strategies import PQModeConfig, PQModeStrategy
@@ -51,6 +56,7 @@ from csp_lib.integration import (
 logger = get_logger("gc_mini_test")
 set_level("info")
 set_level("DEBUG", "gc_mini_test")  # 調整為 DEBUG 級別以查看詳細上傳流程
+# set_level("DEBUG", "afc_lib")  # 詳細日誌
 
 # ============================================================
 # MongoDB 連線設定（請依實際環境修改）
@@ -76,11 +82,32 @@ MONGO_PCS_COLLECTION = "pcs"        # PCS 設備資料 collection 名稱
 # max_retry_count       : 單批寫入失敗最多重試 3 次
 
 UPLOADER_CONFIG = UploaderConfig(
-    flush_interval=10,
-    batch_size_threshold=100,
+    flush_interval=1,
+    batch_size_threshold=1000,
     max_queue_size=5000,
     max_retry_count=3,
 )
+
+# ============================================================
+# 取得當前秒的第一筆值聚合器
+# ============================================================
+@dataclass
+class FirstPerSecondAggregator:
+    """每秒取第一筆值的聚合器，後續同秒讀取保持該值不變。"""
+
+    output_name: str
+    source_name: str
+    _last_second: datetime | None = field(default=None, init=False, repr=False)
+    _last_value: Any = field(default=None, init=False, repr=False)
+
+    def process(self, values: dict[str, Any]) -> dict[str, Any]:
+        result = values.copy()
+        current_second = datetime.now().replace(microsecond=0)
+        if current_second != self._last_second:
+            self._last_second = current_second
+            self._last_value = values.get(self.source_name)
+        result[self.output_name] = self._last_value
+        return result
 
 # ============================================================
 # 主程式
@@ -115,9 +142,14 @@ async def main():
         device_id="pcs_01",
         unit_id=2,
         address_offset=0,       # 部分 PLC 用 1-based addressing（offset=1）
-        read_interval=1.0,      # 每 1 秒讀取一次 → 每分鐘約 60 筆入 queue
+        read_interval=0.1,      # 每 0.1 秒讀取一次 → 每分鐘約 600 筆入 queue
         disconnect_threshold=20, # 連續 5 次失敗後標記為斷線
     )
+    aggregator_pipeline = AggregatorPipeline(aggregators=[
+        FirstPerSecondAggregator(
+            output_name="first_frequency_in_seconds",
+            source_name="frequency",
+        )])
 
     device = PCSDevice(
         config=config,
@@ -125,6 +157,7 @@ async def main():
         always_points=pcs_always_points,
         write_points=pcs_write_points,
         alarm_evaluators=pcs_alarm_evaluators,
+        aggregator_pipeline=aggregator_pipeline,
     )
 
     registry = DeviceRegistry()
@@ -144,12 +177,20 @@ async def main():
     async def on_disconnected(payload):
         print(f"[DISCONNECT] {payload.device_id}: {payload.reason} (failures={payload.consecutive_failures})")
 
-    p_state = {"p": 0}
+    p_state = {"p": 0, "timestamp": None}  # 用於模擬 p_set 的變化
 
     async def on_read_complete(_):
-        p_state["p"] += 1
-        if p_state["p"] > 10:
-            p_state["p"] = -10
+        if p_state.get("timestamp") is None or p_state.get("timestamp") != datetime.now().replace(microsecond=0):
+            p_state["timestamp"] = datetime.now().replace(microsecond=0)
+            p_state["p"] += 1
+            if p_state["p"] > 10:
+                p_state["p"] = -10
+        # uploader.enqueue("command", {
+        #     "device_id": device.config.device_id, 
+        #     "timestamp": datetime.now(), 
+        #     "command": "update_p", 
+        #     "value_p": p_state["p"], 
+        #     "value_t": p_state["timestamp"]})
         pq_strategy.update_config(PQModeConfig(p=p_state["p"], q=0))
         controller.trigger()
 
@@ -165,7 +206,7 @@ async def main():
     manager = dualDBUnifiedDeviceManager(
         dualDBUnifiedConfig(
             mongo_uploader=uploader,    # 傳入後自動啟用 DataUploadManager
-            influx_uploader=influx_uploader,       # 傳入後自動啟用 InfluxBatchUploader
+            # influx_uploader=influx_uploader,       # 傳入後自動啟用 InfluxBatchUploader
             # alarm_repository=None,    # 若需告警持久化，傳入 MongoDB AlarmRepository
             # command_repository=None,  # 若需指令歷史記錄，傳入 MongoDB CommandRepository
             # redis_client=None,        # 若需狀態同步至 Redis，傳入 RedisClient
