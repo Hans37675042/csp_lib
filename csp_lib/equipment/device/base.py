@@ -708,7 +708,7 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
             next_time += interval * n_intervals
             await asyncio.sleep(next_time - current_time)
             
-    def _handle_read_failure(self, error_msg: str) -> None:
+    async def _handle_read_failure(self, error_msg: str) -> None:
         """處理讀取失敗：累加計數 + 記錄失敗時間 + 發送錯誤事件"""
         async with self._status_lock:
             self._consecutive_failures += 1
