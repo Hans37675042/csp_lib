@@ -74,6 +74,9 @@ class InfluxBatchUploader(MongoBatchUploader):
     
     async def _flush_loop(self) -> None:
         """定期檢查並上傳所有 collection 的資料"""
+        # 等到下一個整秒再開始
+        now = time.time()
+        await asyncio.sleep(1 - (now % 1))
         next_time = time.monotonic()
         while not self._stop_event.is_set():
             try:
