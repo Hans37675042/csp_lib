@@ -26,3 +26,5 @@
   已修正於：examples/GC_mini_test/influx_lib.py（InfluxBatchUploader._flush_loop）
 
 [IMPROVE] 時間錨定方式需要加入超時後立即補跑機制，避免因 flush 執行時間過長導致後續 flush 繼續延遲。
+
+[] 多機分配功率時，若個台設備斷線、告警，會排除該設備?
