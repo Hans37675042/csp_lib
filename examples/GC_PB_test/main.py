@@ -13,26 +13,27 @@
     EMS控制如何串接(透過redis)    
     
 '''
-import asyncio
+import asyncio, time
 from sim import *
 from device import *
+from redis_listener import EMSCommandListener
 
 
+from csp_lib.core import get_logger
+from csp_lib.redis import RedisClient
+from motor.motor_asyncio import AsyncIOMotorClient
+from csp_lib.mongo.config import UploaderConfig
+from csp_lib.mongo.uploader import MongoBatchUploader
 
-from csp_lib.equipment.alarm import (
-    AlarmDefinition,
-    AlarmLevel,
-    Operator,
-    ThresholdAlarmEvaluator,
-    ThresholdCondition,
-)
-from csp_lib.equipment.core import ReadPoint, WritePoint
-from csp_lib.equipment.core.point import PointMetadata, RangeValidator
 from csp_lib.equipment.device import AsyncModbusDevice, DeviceConfig
 from csp_lib.integration import (
     DeviceRegistry,
     SystemController,
     SystemControllerConfig,
+)
+from csp_lib.manager import (
+    UnifiedConfig,
+    UnifiedDeviceManager,
 )
 from csp_lib.controller.strategies import (
     StopStrategy,
@@ -40,13 +41,11 @@ from csp_lib.controller.strategies import (
     PQModeStrategy,
 )
 from csp_lib.controller.system import (
-    DynamicSOCProtection,
     ModePriority,
-    SOCProtectionConfig,
 )
-from csp_lib.modbus import Float32, ModbusTcpConfig, PymodbusTcpClient, UInt16
-from csp_lib.modbus_server import PCSSimulator, ServerConfig, SimulationServer
-from csp_lib.modbus_server.simulator.pcs import default_pcs_config
+from csp_lib.modbus import ModbusTcpConfig, PymodbusTcpClient
+
+logger = get_logger("MAIN")
 
 pcs_config = DeviceConfig(
     device_id="pcs_01",
@@ -77,6 +76,21 @@ registry = DeviceRegistry()
 registry.register(pcs_device, traits=["pcs"])
 registry.register(acm_device, traits=["meter"])
 
+#=============================================================
+mongo = AsyncIOMotorClient("mongodb://localhost:27017")["demo"]
+mongo_config = UploaderConfig(
+    flush_interval=5.0,
+    batch_size_threshold=100,
+    max_queue_size=10000,
+    max_retry_count=3,
+)
+mongo_uploader = MongoBatchUploader(mongo, mongo_config)
+unified_config = UnifiedConfig(
+    batch_uploader=mongo_uploader,  # BatchUploader Protocol — 可以傳入任何實作
+)
+manager = UnifiedDeviceManager(unified_config)
+manager.register(pcs_device, "pcs")
+#=============================================================
 controller_config = (
     SystemControllerConfig.builder()
     .map_context(point_name="soc", target="soc", device_id="pcs_01")
@@ -100,13 +114,30 @@ controller.register_mode("pq_mode", pq_strategy, ModePriority.MANUAL, "固定PQ�
 
 async def main() -> None:
     sim_server = create_sim()
+    start_time = time.monotonic()
     async with sim_server:
-        print("模擬伺服器已啟動，正在運行中...")
+        logger.info("模擬伺服器已啟動，正在運行中...")
         async with pcs_device, acm_device:
-            await controller.set_base_mode("stop")
-            async with controller:
-                while True:
-                    await asyncio.sleep(1)
+            async with manager:
+                await controller.set_base_mode("stop")
+
+                redis_client = RedisClient(host="localhost", port=6379)
+                await redis_client.connect()
+                ems_listener = EMSCommandListener(
+                    redis_client=redis_client,
+                    controller=controller,
+                    pq_strategy=pq_strategy,
+                )
+                await ems_listener.start()
+
+                async with controller:
+                        while True:
+                            logger.info("*"*60)
+                            now_time = time.monotonic()
+                            start_time += 1
+                            sleep_time = start_time - now_time
+                            await asyncio.sleep(max(0, sleep_time))
+    await ems_listener.stop()
         
 
 if __name__ == "__main__":
