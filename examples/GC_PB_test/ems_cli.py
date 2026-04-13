@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta
 
 from csp_lib.redis import RedisClient
 
@@ -32,7 +33,27 @@ def main() -> None:
     if action == "set_mode":
         cmd = {"action": "set_mode", "mode": sys.argv[2]}
     elif action == "set_pq":
-        cmd = {"action": "set_pq", "p": float(sys.argv[2]), "q": float(sys.argv[3])}
+        # CLI 維持簡便：set_pq <p> <q>
+        # 內部換算為「5 秒後開始、5 秒內爬完」的 PQ_ramp_Time 指令
+        # 固定使用 ramp_p + end_time 格式，end_time 送絕對時間
+        p_target = float(sys.argv[2])
+        q_target = float(sys.argv[3])
+        p_start = 0.0           # 假設由 stop 模式開始，起點為 0
+        ramp_duration = 5.0     # 爬升耗時 (s)
+        delay = 5.0             # 開始前延遲 (s)
+        end_time = datetime.now() + timedelta(seconds=delay + ramp_duration)
+        p_diff = abs(p_target - p_start)
+        if p_diff == 0:
+            print("set_pq 需要非零 p_end（p_start 假設為 0）。若要停機請使用 set_mode stop。")
+            sys.exit(1)
+        cmd = {
+            "action": "set_pq",
+            "p_start": p_start,
+            "p_end": p_target,
+            "q": q_target,
+            "ramp_p": p_diff / ramp_duration,
+            "end_time": end_time.isoformat(),
+        }
     elif action in ("push_override", "pop_override"):
         cmd = {"action": action, "mode": sys.argv[2]}
     else:

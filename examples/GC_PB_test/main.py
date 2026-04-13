@@ -22,6 +22,7 @@ from device import (
     solar_read_points,
     load_read_points,
 )
+from strategy import PQ_ramp_Time_ModeConfig, PQ_ramp_Time_ModeStrategy
 from redis_listener import EMSCommandListener
 
 
@@ -141,6 +142,7 @@ manager.register(load_device, "load")
 controller_config = (
     SystemControllerConfig.builder()
     .map_context(point_name="soc", target="soc", device_id="bms_01")
+    .map_context(point_name="q_actual", target="extra.pcs_q", device_id="pcs_01")
     .map_command(field="p_target", point_name="p_setpoint", device_id="pcs_01")
     .map_command(field="q_target", point_name="q_setpoint", device_id="pcs_01")
 
@@ -155,9 +157,21 @@ controller_config = (
 controller = SystemController(registry, controller_config)
 
 stop_strategy = StopStrategy()
-pq_strategy = PQModeStrategy(PQModeConfig(p=0, q=0))
+
+# PQ_ramp_Time_ModeStrategy 初始以 placeholder config 建立，
+# 實際參數由 EMSCommandListener 透過 update_config() 注入。
+_ramp_placeholder_now = datetime.now()
+ramp_strategy = PQ_ramp_Time_ModeStrategy(
+    PQ_ramp_Time_ModeConfig(
+        p_start=0.0,
+        p_end=0.0,
+        q=0.0,
+        start_time=_ramp_placeholder_now,
+        end_time=_ramp_placeholder_now + timedelta(seconds=1),
+    )
+)
 controller.register_mode("stop", stop_strategy, ModePriority.SCHEDULE, "停止模式")
-controller.register_mode("pq_mode", pq_strategy, ModePriority.MANUAL, "固定PQ模式")
+controller.register_mode("pq_mode", ramp_strategy, ModePriority.MANUAL, "時間 ramp PQ 模式")
 
 
 
@@ -176,7 +190,7 @@ async def main() -> None:
                 ems_listener = EMSCommandListener(
                     redis_client=redis_client,
                     controller=controller,
-                    pq_strategy=pq_strategy,
+                    ramp_strategy=ramp_strategy,
                 )
                 await ems_listener.start()
 

@@ -1,11 +1,13 @@
 import asyncio
 import json
+from datetime import datetime
 from typing import Any
 
 from csp_lib.core import get_logger
 from csp_lib.redis import RedisClient
 from csp_lib.integration import SystemController
-from csp_lib.controller.strategies import PQModeConfig, PQModeStrategy
+
+from strategy import PQ_ramp_Time_ModeConfig, PQ_ramp_Time_ModeStrategy
 
 logger = get_logger(__name__)
 
@@ -19,12 +21,12 @@ class EMSCommandListener:
         self,
         redis_client: RedisClient,
         controller: SystemController,
-        pq_strategy: PQModeStrategy,
+        ramp_strategy: PQ_ramp_Time_ModeStrategy,
         channel: str = CHANNEL,
     ) -> None:
         self._client = redis_client
         self._controller = controller
-        self._pq_strategy = pq_strategy
+        self._ramp_strategy = ramp_strategy
         self._channel = channel
         self._listen_task: asyncio.Task[None] | None = None
         self._pubsub: Any | None = None
@@ -65,10 +67,22 @@ class EMSCommandListener:
                 logger.info("Mode switched to: {}", mode)
 
             elif action == "set_pq":
-                p = float(cmd["p"])
+                p_start = float(cmd["p_start"])
+                p_end = float(cmd["p_end"])
                 q = float(cmd["q"])
-                self._pq_strategy.update_config(PQModeConfig(p=p, q=q))
-                logger.info("PQ updated: P={}, Q={}", p, q)
+                ramp_p = float(cmd["ramp_p"])
+                end_time = datetime.fromisoformat(cmd["end_time"])
+                self._ramp_strategy.update_config(PQ_ramp_Time_ModeConfig(
+                    p_start=p_start,
+                    p_end=p_end,
+                    q=q,
+                    ramp_p=ramp_p,
+                    end_time=end_time,
+                ))
+                logger.info(
+                    "Ramp updated: p={}->{}, q={}, ramp_p={}, end_time={}",
+                    p_start, p_end, q, ramp_p, end_time.isoformat(),
+                )
 
             elif action == "push_override":
                 await self._controller.push_override(cmd["mode"])
