@@ -29,7 +29,6 @@ from redis_listener import EMSCommandListener
 
 from csp_lib.core import get_logger
 from csp_lib.redis import RedisClient
-from motor.motor_asyncio import AsyncIOMotorClient
 from csp_lib.mongo import create_mongo_client, MongoConfig
 from csp_lib.mongo.config import UploaderConfig
 from csp_lib.mongo.uploader import MongoBatchUploader
@@ -44,11 +43,7 @@ from csp_lib.manager import (
     UnifiedConfig,
     UnifiedDeviceManager,
 )
-from csp_lib.controller.strategies import (
-    StopStrategy,
-    PQModeConfig,
-    PQModeStrategy,
-)
+from csp_lib.controller.strategies import StopStrategy
 from csp_lib.controller.system import (
     ModePriority,
 )
