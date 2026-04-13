@@ -200,6 +200,8 @@ class PQ_SOC_ModeStrategy(PQ_ramp_ModeStrategy):
     def __init__(self, config: PQ_SOC_ModeConfig) -> None:
         self._config = config or PQ_SOC_ModeConfig()
         self.interval_seconds = 1.0
+        self._cached_duration_p: float | None = None
+        self._last_recompute_ts: float | None = None
     
     def _compute_p_end(self, context: StrategyContext) -> float:
         soc = context.extra["soc"]
@@ -220,8 +222,20 @@ class PQ_SOC_ModeStrategy(PQ_ramp_ModeStrategy):
         now = context.current_time.timestamp()
         duration_h = (self._config.soc_time.timestamp() - now) / 3600  # 計算剩餘時間（小時）
         if duration_h > 0:
-            # 按剩餘電量與剩餘時間計算所需功率
-            return (target - soc) / 100 * self._config.capacity / duration_h
+            # 按剩餘電量與剩餘時間計算所需功率（受 soc_time_interval 控制重算週期）
+            interval = self._config.soc_time_interval
+            now = context.current_time.timestamp()
+
+            if interval is None or self._cached_duration_p is None or self._last_recompute_ts is None:
+                self._cached_duration_p = (target - soc) / 100 * self._config.capacity / duration_h
+                self._last_recompute_ts = now
+                return self._cached_duration_p
+
+            if now - self._last_recompute_ts >= interval:
+                self._cached_duration_p = (target - soc) / 100 * self._config.capacity / duration_h
+                self._last_recompute_ts = now
+
+            return self._cached_duration_p
 
         # 已過充電時間
         return 0.0
@@ -244,3 +258,8 @@ class PQ_SOC_ModeStrategy(PQ_ramp_ModeStrategy):
         p_target = self._ramp(p_end, context.extra["pcs_p"], self._config.ramp_p)
         q_target = self._ramp(self._config.q, context.extra["pcs_q"], self._config.ramp_q)
         return Command(p_target=p_target, q_target=q_target)
+
+    def update_config(self, config: PQ_SOC_ModeConfig) -> None:
+        super().update_config(config)
+        self._cached_duration_p = None
+        self._last_recompute_ts = None
