@@ -9,6 +9,8 @@ from csp_lib.controller.strategies.pq_strategy import PQModeConfig, PQModeStrate
 logger = get_logger("Strategy")
 
 class StrategyReprMixin:
+    """策略字串表示 Mixin，讓策略物件印出時顯示類別名稱與設定參數。"""
+
     def __str__(self) -> str:
         cls_name = type(self).__name__
         if hasattr(self, '_config') and hasattr(self._config, '__dataclass_fields__'):
@@ -27,24 +29,28 @@ class StrategyReprMixin:
 # ramp 直接上升 ==============================
 @dataclass(frozen=True, slots=True)
 class PQ_ramp_ModeConfig():
-    p: float = 0.0
-    q: float = 0.0
-    ramp_p: float = 0.0
-    ramp_q: float = 0.0
+    p: float = 0.0        # 有功功率目標值 (kW)
+    q: float = 0.0        # 無功功率目標值 (kVar)
+    ramp_p: float = 0.0   # 有功功率斜率 (kW/s)，0 表示不限速直接到達
+    ramp_q: float = 0.0   # 無功功率斜率 (kVar/s)，0 表示不限速直接到達
 
 class PQ_ramp_ModeStrategy(StrategyReprMixin, PQModeStrategy):
+    """直接斜率控制策略：以固定 kW/s 斜率逐步趨近目標功率。"""
+
     def __init__(self, config: PQ_ramp_ModeConfig | None = None):
         self._config = config or PQ_ramp_ModeConfig()
         self.interval_seconds = 1.0
 
     def _ramp(self, end: float, last: float, ramp: float) -> float:
+        """計算單次步進值：根據斜率與執行間隔算出本次可變動量，若剩餘差距小於步進量則直接到達目標。"""
         diff = abs(ramp)*self.interval_seconds
         if abs(end - last) > diff and diff > 0:
             return last + diff * (1 if end > last else -1)
-        else:                
+        else:
             return end
 
     def execute(self, context: StrategyContext) -> Command:
+        """讀取 PCS 回授的 P/Q，經斜率計算後回傳 Command。"""
         if context.extra.get("pcs_p") is None:
             msg = "StrategyContext.extra['pcs_p'] is required (PCS active power reading)"
             logger.error(msg)
@@ -66,29 +72,32 @@ class PQ_ramp_ModeStrategy(StrategyReprMixin, PQModeStrategy):
 @dataclass(frozen=True, slots=True)
 class PQ_ramp_Time_ModeConfig():
     '''
-    設定執行時間的斜率控制，必須滿足:
+    時間窗口斜率控制設定，必須滿足:
     1. start_time, end_time 至少設定一個，若兩者皆設定則忽略 2.
-    2. ramp_p, seconds 擇一設定，若兩者皆設定則以ramp_p為主
+    2. ramp_p, seconds 擇一設定，若兩者皆設定則以 ramp_p 為主
     '''
-    p_start: float = 0.0
-    p_end: float = 0.0
-    q: float = 0.0
+    p_start: float = 0.0                  # 起始有功功率 (kW)
+    p_end: float = 0.0                    # 結束有功功率 (kW)
+    q: float = 0.0                        # 無功功率目標值 (kVar)
 
-    start_time: datetime | None = None
-    end_time: datetime | None = None
+    start_time: datetime | None = None    # 斜率開始時間（可選）
+    end_time: datetime | None = None      # 斜率結束時間（可選）
 
-    ramp_p: float | None = None
-    seconds: int | None = None
+    ramp_p: float | None = None           # 有功功率斜率 (kW/s)（與 seconds 擇一）
+    seconds: int | None = None            # 斜率持續秒數（與 ramp_p 擇一）
 
-    ramp_q: float = 0.0
+    ramp_q: float = 0.0                   # 無功功率斜率 (kVar/s)
 
 class PQ_ramp_Time_ModeStrategy(PQ_ramp_ModeStrategy):
+    """時間窗口斜率策略：在指定時間區間內，從 p_start 線性變化到 p_end。"""
+
     def __init__(self, config: PQ_ramp_Time_ModeConfig | None = None):
         self._config = config or PQ_ramp_Time_ModeConfig()
         self.interval_seconds = 1.0
         self._check()
 
     def _check(self):
+        """初始化：驗證設定 → 解析持續時間與斜率 → 計算起訖時間戳。"""
         self._validate_config()
         self.duration, self.ramp_p = self._resolve_duration_and_ramp()
         self.time_start, self.time_end = self._resolve_time_window()
@@ -123,7 +132,13 @@ class PQ_ramp_Time_ModeStrategy(PQ_ramp_ModeStrategy):
                 raise ValueError(msg)
 
     def _resolve_duration_and_ramp(self) -> tuple[float, float]:
-        """根據 config 決定 duration 與 ramp_p"""
+        """
+        根據 config 決定持續時間 (duration) 與斜率 (ramp_p)。
+        三種推算方式（優先順序）：
+        1. 雙時間 → 由時間差反推斜率
+        2. 指定 ramp_p → 由斜率反推持續時間
+        3. 指定 seconds → 由秒數反推斜率
+        """
         c = self._config
         p_diff = abs(c.p_end - c.p_start)
 
@@ -142,7 +157,7 @@ class PQ_ramp_Time_ModeStrategy(PQ_ramp_ModeStrategy):
         return duration, p_diff / duration
 
     def _resolve_time_window(self) -> tuple[float, float]:
-        """根據 config 與 duration 決定起訖時間"""
+        """根據 config 與 duration 決定起訖時間戳（缺少的一端由 duration 補算）。"""
         c = self._config
         if c.start_time is not None and c.end_time is not None:
             return c.start_time.timestamp(), c.end_time.timestamp()
@@ -153,6 +168,7 @@ class PQ_ramp_Time_ModeStrategy(PQ_ramp_ModeStrategy):
         return end - self.duration, end
 
     def _compute_p_target(self, context: StrategyContext) -> float:
+        """根據當前時間計算 P 目標值：時間窗口前回傳 p_start，窗口後回傳 p_end，窗口內線性插值。"""
         if context.current_time is None:
             msg = "StrategyContext.current_time is required for time-based PQ ramp strategy"
             logger.error(msg)
@@ -169,6 +185,7 @@ class PQ_ramp_Time_ModeStrategy(PQ_ramp_ModeStrategy):
         return c.p_start + sign * delta
 
     def execute(self, context: StrategyContext) -> Command:
+        """根據時間窗口計算 P 目標，Q 維持斜率控制。"""
         if context.extra.get("pcs_q") is None:
             msg = "StrategyContext.extra['pcs_q'] is required (PCS reactive power reading)"
             logger.error(msg)
@@ -179,31 +196,40 @@ class PQ_ramp_Time_ModeStrategy(PQ_ramp_ModeStrategy):
         return Command(p_target=p_target, q_target=q_target)
 
     def update_config(self, config) -> None:
+        """更新設定後重新驗證與解析參數。"""
         self._config = config
         self._check()
 
 # 設定 SOC ==============================
 @dataclass(frozen=True, slots=True)
 class PQ_SOC_ModeConfig():
-    soc_target: float
+    soc_target: float                          # SOC 目標值 (%)
 
-    p: float = 0.0
-    q: float = 0.0
-    ramp_p: float = 0.0
-    ramp_q: float = 0.0
+    p: float = 0.0                             # 固定充電功率 (kW)，未設定 soc_time 時使用
+    q: float = 0.0                             # 無功功率目標值 (kVar)
+    ramp_p: float = 0.0                        # 有功功率斜率 (kW/s)
+    ramp_q: float = 0.0                        # 無功功率斜率 (kVar/s)
 
-    soc_time: datetime | None = None
-    soc_time_interval: int | None = None
-    capacity: float | None = None
+    soc_time: datetime | None = None           # 預計充飽時間（可選，啟用時間排程充電）
+    soc_time_interval: int | None = None       # 重算功率的間隔秒數（可選，None 表示每次都重算）
+    capacity: float | None = None              # 電池容量 (kWh)，搭配 soc_time 使用
 
 class PQ_SOC_ModeStrategy(PQ_ramp_ModeStrategy):
+    """SOC 目標充電策略：根據 SOC 差距與剩餘時間動態計算充電功率。"""
+
     def __init__(self, config: PQ_SOC_ModeConfig) -> None:
         self._config = config or PQ_SOC_ModeConfig()
         self.interval_seconds = 1.0
-        self._cached_duration_p: float | None = None
-        self._last_recompute_ts: float | None = None
-    
+        self._cached_duration_p: float | None = None    # 快取的計算功率
+        self._last_recompute_ts: float | None = None    # 上次重算的時間戳
+
     def _compute_p_end(self, context: StrategyContext) -> float:
+        """
+        計算目標充電功率：
+        - SOC 已達標 → 回傳 0
+        - 未設定 soc_time → 使用固定功率 config.p
+        - 已設定 soc_time → 依剩餘電量與剩餘時間動態計算（受 soc_time_interval 控制重算頻率）
+        """
         soc = context.extra["soc"]
         target = self._config.soc_target
 
@@ -241,6 +267,7 @@ class PQ_SOC_ModeStrategy(PQ_ramp_ModeStrategy):
         return 0.0
 
     def execute(self, context: StrategyContext) -> Command:
+        """讀取 SOC 與 PCS 回授，計算充電功率後經斜率控制回傳 Command。"""
         if context.extra.get("soc") is None:
             msg = "StrategyContext.extra['soc'] is required (battery SOC %)"
             logger.error(msg)
@@ -260,6 +287,7 @@ class PQ_SOC_ModeStrategy(PQ_ramp_ModeStrategy):
         return Command(p_target=p_target, q_target=q_target)
 
     def update_config(self, config: PQ_SOC_ModeConfig) -> None:
+        """更新設定並清除快取，下次 execute 時會重新計算功率。"""
         super().update_config(config)
         self._cached_duration_p = None
         self._last_recompute_ts = None
