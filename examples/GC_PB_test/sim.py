@@ -1,5 +1,3 @@
-import asyncio
-
 from csp_lib.modbus_server import (
     ControllabilityMode,
     DeviceLinkConfig,
