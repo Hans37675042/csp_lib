@@ -45,7 +45,9 @@ from csp_lib.manager import (
 )
 from csp_lib.controller.strategies import StopStrategy
 from csp_lib.controller.system import (
+    DynamicSOCProtection,
     ModePriority,
+    SOCProtectionConfig,
 )
 from csp_lib.modbus import ModbusTcpConfig, PymodbusTcpClient
 
@@ -135,6 +137,13 @@ manager.register(bms_device, "bms")
 manager.register(solar_device, "solar")
 manager.register(load_device, "load")
 #=============================================================
+# SOC 保護配置：SOC 上限 95%、下限 5%、警戒區 5%
+soc_protection_config = SOCProtectionConfig(
+    soc_high=95.0,
+    soc_low=5.0,
+    warning_band=5.0,
+)
+
 controller_config = (
     SystemControllerConfig.builder()
     .map_context(point_name="soc", target="soc", device_id="bms_01")
@@ -147,6 +156,7 @@ controller_config = (
     .map_context(point_name="voltage_a", target="extra.voltage", device_id="acm_01")
     .map_context(point_name="ac_power", target="extra.solar_power", device_id="solar_01")
     .map_context(point_name="p_actual", target="extra.load_power", device_id="load_01")
+    .protect(DynamicSOCProtection(soc_protection_config))
     .auto_stop(enabled=True)
     .build()
 )
