@@ -196,7 +196,7 @@ async def main() -> None:
                 ems_listener = EMSCommandListener(
                     redis_client=redis_client,
                     controller=controller,
-                    ramp_strategy=ramp_strategy,
+                    ramp_mode_name="pq_mode",
                 )
                 await ems_listener.start()
 

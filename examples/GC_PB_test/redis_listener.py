@@ -7,7 +7,7 @@ from csp_lib.core import get_logger
 from csp_lib.redis import RedisClient
 from csp_lib.integration import SystemController
 
-from strategy import PQ_ramp_Time_ModeConfig, PQ_ramp_Time_ModeStrategy
+from strategy import PQ_ramp_Time_ModeConfig
 
 logger = get_logger(__name__)
 
@@ -21,12 +21,12 @@ class EMSCommandListener:
         self,
         redis_client: RedisClient,
         controller: SystemController,
-        ramp_strategy: PQ_ramp_Time_ModeStrategy,
+        ramp_mode_name: str = "pq_mode",
         channel: str = CHANNEL,
     ) -> None:
         self._client = redis_client
         self._controller = controller
-        self._ramp_strategy = ramp_strategy
+        self._ramp_mode_name = ramp_mode_name
         self._channel = channel
         self._listen_task: asyncio.Task[None] | None = None
         self._pubsub: Any | None = None
@@ -72,7 +72,11 @@ class EMSCommandListener:
                 q = float(cmd["q"])
                 ramp_p = float(cmd["ramp_p"])
                 end_time = datetime.fromisoformat(cmd["end_time"])
-                self._ramp_strategy.update_config(PQ_ramp_Time_ModeConfig(
+                mm = getattr(self._controller, "mode_manager", None)
+                if mm is None:
+                    mm = self._controller.system_controller.mode_manager
+                strategy = mm.registered_modes[self._ramp_mode_name].strategy
+                strategy.update_config(PQ_ramp_Time_ModeConfig(
                     p_start=p_start,
                     p_end=p_end,
                     q=q,
@@ -80,8 +84,8 @@ class EMSCommandListener:
                     end_time=end_time,
                 ))
                 logger.info(
-                    "Ramp updated: p={}->{}, q={}, ramp_p={}, end_time={}",
-                    p_start, p_end, q, ramp_p, end_time.isoformat(),
+                    "Ramp updated on mode '{}': p={}->{}, q={}, ramp_p={}, end_time={}",
+                    self._ramp_mode_name, p_start, p_end, q, ramp_p, end_time.isoformat(),
                 )
 
             elif action == "push_override":
