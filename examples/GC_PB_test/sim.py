@@ -103,3 +103,14 @@ def create_sim() -> SimulationServer:
 
     server.set_microgrid(mg)
     return server
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    async def _run() -> None:
+        async with create_sim():
+            print(f"[SIM] listening on {SIM_HOST}:{SIM_PORT}")
+            await asyncio.Event().wait()
+
+    asyncio.run(_run())
