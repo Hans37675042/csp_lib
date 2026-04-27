@@ -1,20 +1,19 @@
-# GitHub Actions: CI
+# GitHub Actions: CI (legacy — idle)
 #
-# 持續整合與發佈 csp_lib pure Python package
+# 歷史用途：手動發版時代的單一 CI + publish workflow。
 #
-# 觸發策略:
-#   - PR: lint + test + build
-#   - Tag (v*): lint + test + build + publish
-#   - 手動觸發: 完整流程
+# 現況（release-please 遷移中）：
+#   - CI / lint / test / build 由 ci.new.yml 接手（2 OS matrix + build-check）
+#   - Publish 由 release.new.yml 接手（tag 觸發 + OIDC trusted publishing）
+#   - 本檔 trigger 收束為 workflow_dispatch only，保留 job 定義作為緊急 manual fallback
+#     （例如新 workflow 壞掉時手動觸發單一 workflow 完成發版）
+#
+# Phase 3 切換完成後計畫整檔刪除。
 
-name: CI
+name: CI (legacy)
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
-  pull_request:
 
 jobs:
   # ============ Lint (PR + Tag 都會跑) ============
@@ -25,7 +24,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
 
@@ -73,7 +72,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
 
@@ -103,7 +102,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.13"
 
@@ -144,7 +143,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.13"
 
@@ -187,7 +186,7 @@ jobs:
           attestations: true
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           body_path: release_notes.md

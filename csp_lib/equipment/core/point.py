@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+from csp_lib.core.errors import ConfigurationError
 from csp_lib.modbus import ByteOrder, FunctionCode, ModbusDataType, RegisterOrder
 
 if TYPE_CHECKING:
@@ -42,6 +43,10 @@ class PointDefinition:
         function_code: Modbus 功能碼
         byte_order: 位元組順序
         register_order: 暫存器順序
+        unit_id: 此點位要送往的 Modbus unit_id（slave address）。
+            - ``None``（預設）：沿用所屬 ``AsyncModbusDevice`` 的 ``DeviceConfig.unit_id``
+            - ``int``（0-255）：覆寫至指定 unit，用於 SMA 風格單一物理設備
+              掛多個 Modbus unit（如 Inverter + MeterCorrection 共享 TCP 連線）
     """
 
     name: str
@@ -50,6 +55,11 @@ class PointDefinition:
     function_code: FunctionCode | None = None
     byte_order: ByteOrder = ByteOrder.BIG_ENDIAN
     register_order: RegisterOrder = RegisterOrder.HIGH_FIRST
+    unit_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.unit_id is not None and not 0 <= self.unit_id <= 255:
+            raise ConfigurationError(f"point {self.name!r} 的 unit_id={self.unit_id} 超出 Modbus 合法範圍 [0, 255]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,13 +92,23 @@ class ReadPoint(PointDefinition):
             - "": 參與自動合併邏輯
             - str: 只與相同 read_group 名稱的點位合併
         metadata: 點位元資料（可選）
+        reject_non_finite: v0.8.0+ 新增。當為 ``True`` 時，若本次讀取值為
+            非有限 float（NaN / +Inf / -Inf），設備會：
+              - 保留 ``_latest_values`` 中的舊值（不覆寫）
+              - log WARNING
+              - **不**發 ``value_change`` 事件
+              - **不**將該非有限值餵給 ``_evaluate_alarm`` 或 ``EVENT_READ_COMPLETE``
+            用於防禦通訊瞬態讓上層保護/策略看到 NaN 造成比較恆 False 被無聲繞過。
+            預設 ``False``（維持 v0.7.x 既有行為 — 非有限值直接寫入 latest）。
     """
 
     pipeline: ProcessingPipeline | None = None
     read_group: str = ""
     metadata: PointMetadata | None = None
+    reject_non_finite: bool = False
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.function_code is None:
             object.__setattr__(self, "function_code", FunctionCode.READ_HOLDING_REGISTERS)
 
@@ -109,6 +129,7 @@ class WritePoint(PointDefinition):
     metadata: PointMetadata | None = None
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.function_code is None:
             object.__setattr__(self, "function_code", FunctionCode.WRITE_MULTIPLE_REGISTERS)
 

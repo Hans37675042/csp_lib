@@ -15,12 +15,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
-from csp_lib.controller.core import Command
+from csp_lib.controller.core import NO_CHANGE, Command, NoChange, is_no_change
 from csp_lib.core import get_logger
 
 logger = get_logger(__name__)
+
+# SOC 取值函式簽名：接收 DeviceSnapshot，回傳 SOC (0~100) 或 None
+# 回傳 None 代表該 snapshot 無法提供 SOC，會 fallback 到內建 capability 讀取。
+SOCSource = Callable[["DeviceSnapshot"], "float | None"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +102,9 @@ class EqualDistributor:
         n = len(devices)
         if n == 0:
             return {}
-        p_each = command.p_target / n
-        q_each = command.q_target / n
+        # NO_CHANGE 軸不切分，per-device 保留 sentinel
+        p_each: float | NoChange = NO_CHANGE if is_no_change(command.p_target) else command.p_target / n
+        q_each: float | NoChange = NO_CHANGE if is_no_change(command.q_target) else command.q_target / n
         return {d.device_id: Command(p_target=p_each, q_target=q_each) for d in devices}
 
 
@@ -130,13 +135,18 @@ class ProportionalDistributor:
             logger.warning(f"Total rated '{self._rated_key}' is 0, falling back to equal distribution.")
             return EqualDistributor().distribute(command, devices)
 
+        # NO_CHANGE 軸不切分，per-device 保留 sentinel
+        p_no_change = is_no_change(command.p_target)
+        q_no_change = is_no_change(command.q_target)
+        p_val_base = command.effective_p(0.0)
+        q_val_base = command.effective_q(0.0)
+
         result: dict[str, Command] = {}
         for d in devices:
             ratio = d.metadata.get(self._rated_key, 0.0) / total_rated
-            result[d.device_id] = Command(
-                p_target=command.p_target * ratio,
-                q_target=command.q_target * ratio,
-            )
+            p_val: float | NoChange = NO_CHANGE if p_no_change else p_val_base * ratio
+            q_val: float | NoChange = NO_CHANGE if q_no_change else q_val_base * ratio
+            result[d.device_id] = Command(p_target=p_val, q_target=q_val)
         return result
 
 
@@ -164,6 +174,12 @@ class SOCBalancingDistributor:
         gain: SOC 偏差增益（預設 2.0）
         per_device_max_p: 單台設備最大有功功率限制 (kW)，None 表示不限制
         per_device_max_q: 單台設備最大無功功率限制 (kVar)，None 表示不限制
+        soc_source: 自訂 SOC 取值函式（可選）。若提供，優先用此函式計算；
+            回傳 None 時退回內建 capability 讀取路徑。本參數專為「SOC 不在
+            capability slot、而在 latest_values / metadata / 外部來源」的場景設計。
+            **例外行為**：``soc_source`` 若拋例外，**不會**被攔截，直接傳播
+            給 ``distribute()`` 呼叫方，以避免 silent corruption（分配決策
+            永遠應基於明確成功取得的狀態）。
     """
 
     def __init__(
@@ -174,6 +190,7 @@ class SOCBalancingDistributor:
         gain: float = 2.0,
         per_device_max_p: float | None = None,
         per_device_max_q: float | None = None,
+        soc_source: SOCSource | None = None,
     ) -> None:
         self._rated_key = rated_key
         self._soc_capability = soc_capability
@@ -181,17 +198,54 @@ class SOCBalancingDistributor:
         self._gain = gain
         self._per_device_max_p = per_device_max_p
         self._per_device_max_q = per_device_max_q
+        self._soc_source = soc_source
+
+    def _read_soc(self, d: DeviceSnapshot) -> float | None:
+        """
+        讀取單一設備的 SOC。
+
+        優先順序：
+            1. 若提供 ``soc_source``，呼叫之。
+               - 回傳非 None：直接使用（由呼叫方保證語意正確）。
+               - 回傳 None：視為「此來源無法提供」，退回步驟 2。
+               - 例外：**不攔截**，傳播至 ``distribute()`` 呼叫方。
+            2. 預設行為：讀 ``capabilities[soc_capability][soc_slot]``，
+               與 v0.8.1 之前完全一致。
+
+        Args:
+            d: 設備快照。
+
+        Returns:
+            SOC 值（0~100），或 ``None`` 表示無資料。
+        """
+        if self._soc_source is not None:
+            value = self._soc_source(d)
+            if value is not None:
+                return value
+        # Fallback：沿用既有 capability 讀取路徑（預設行為不變）
+        return d.get_capability_value(self._soc_capability, self._soc_slot)
 
     def distribute(self, command: Command, devices: list[DeviceSnapshot]) -> dict[str, Command]:
         n = len(devices)
         if n == 0:
             return {}
 
-        # 收集 SOC 和額定值
+        # NO_CHANGE 軸不切分，保留 sentinel 給每台設備
+        p_no_change = is_no_change(command.p_target)
+        q_no_change = is_no_change(command.q_target)
+        # 守衛後的 float 值（NO_CHANGE 軸以 0.0 占位，僅供 float 運算不輸出）
+        p_base = command.effective_p(0.0)
+        q_base = command.effective_q(0.0)
+
+        # 若兩軸皆 NO_CHANGE，所有設備皆 NO_CHANGE（快速路徑）
+        if p_no_change and q_no_change:
+            return {d.device_id: Command(p_target=NO_CHANGE, q_target=NO_CHANGE) for d in devices}
+
+        # 收集 SOC 和額定值（SOC 透過 _read_soc helper 取得，支援 soc_source 注入）
         socs: list[float | None] = []
         rateds: list[float] = []
         for d in devices:
-            soc = d.get_capability_value(self._soc_capability, self._soc_slot)
+            soc = self._read_soc(d)
             socs.append(float(soc) if soc is not None else None)
             rateds.append(float(d.metadata.get(self._rated_key, 0.0)))
 
@@ -207,8 +261,19 @@ class SOCBalancingDistributor:
             return ProportionalDistributor(self._rated_key).distribute(command, devices)
         avg_soc = sum(valid_socs) / len(valid_socs)
 
-        # 計算 P 分配權重
-        is_discharging = command.p_target > 0
+        # 若 P 為 NO_CHANGE → 不計算 P 權重；僅分 Q
+        if p_no_change:
+            result: dict[str, Command] = {}
+            for i, d in enumerate(devices):
+                q_ratio = rateds[i] / total_rated
+                q_val: float | NoChange = NO_CHANGE if q_no_change else q_base * q_ratio
+                result[d.device_id] = Command(p_target=NO_CHANGE, q_target=q_val)
+            if self._per_device_max_q is not None:
+                result = self._apply_clamp_and_overflow(result, "q_target", self._per_device_max_q)
+            return result
+
+        # 計算 P 分配權重（以下 p_target 已非 NO_CHANGE，用 p_base 計算）
+        is_discharging = p_base > 0
         p_weights: list[float] = []
         for i, _d in enumerate(devices):
             rated = rateds[i]
@@ -231,19 +296,20 @@ class SOCBalancingDistributor:
             return ProportionalDistributor(self._rated_key).distribute(command, devices)
 
         # P 按 SOC 平衡權重分配，Q 按額定比例分配
-        result: dict[str, Command] = {}
+        result = {}
         for i, d in enumerate(devices):
             p_ratio = p_weights[i] / total_p_weight
             q_ratio = rateds[i] / total_rated
+            q_val2: float | NoChange = NO_CHANGE if q_no_change else q_base * q_ratio
             result[d.device_id] = Command(
-                p_target=command.p_target * p_ratio,
-                q_target=command.q_target * q_ratio,
+                p_target=p_base * p_ratio,
+                q_target=q_val2,
             )
 
         # 硬體限幅 + 溢出轉移
         if self._per_device_max_p is not None:
             result = self._apply_clamp_and_overflow(result, "p_target", self._per_device_max_p)
-        if self._per_device_max_q is not None:
+        if self._per_device_max_q is not None and not q_no_change:
             result = self._apply_clamp_and_overflow(result, "q_target", self._per_device_max_q)
 
         return result
@@ -340,4 +406,5 @@ __all__ = [
     "EqualDistributor",
     "ProportionalDistributor",
     "SOCBalancingDistributor",
+    "SOCSource",
 ]

@@ -1,0 +1,316 @@
+# ======================================================================
+# GitHub Actions: Release (tag 觸發 → PyPI + GitHub Release)
+#
+# 目的：release-please merge Release PR 後會自動建立 tag，此 workflow
+#       由 tag push 觸發，完成「發版前最後驗證 → PyPI 發佈 → GitHub Release」。
+#
+# 觸發策略：
+#   - tag push `v[0-9]+.[0-9]+.[0-9]+`（正式版）
+#   - tag push `v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+`（預發佈→ TestPyPI）
+#   - 其他 tag（例如 `v0.8.2-backup`）不觸發
+#   - workflow_dispatch（手動 / release-please.yml 呼叫）：用來繞過
+#     「GITHUB_TOKEN 推 tag 不觸發 workflow」的 GitHub 限制。release-please
+#     merge Release PR 後會用 gh CLI 以該 tag 的 ref 呼叫此 workflow。
+#
+# Job 拓樸（needs 鏈）：
+#   preflight ──┬─▶ test (3 OS matrix)  ──┐
+#               ├─▶ build dist            ├─▶ publish-pypi / publish-testpypi
+#               └─▶ notes                 ┘            │
+#                                                     ▼
+#                                          create-gh-release
+#
+# 為何 publish 前還跑一次 3 OS test：
+#   - PyPI 版本號 immutable（用過就燒掉，即使 yank 也不能重發同一個 X.Y.Z）
+#   - test fail → publish 不跑 → 沒燒版本號，可開 fix PR 後 release-please 自動推下個 patch
+#   - 詳細失敗恢復流程見 docs/15-Development/Release Recovery.md
+#
+# 為何 publish-pypi 用 environment: pypi：
+#   - 在 GitHub repo Settings → Environments → pypi 設 Required reviewers = 自己
+#   - tag 推上去後 test/build 都綠才會 prompt 你 approve，最後一道人工關卡
+#
+# 改動摘要 vs build-wheels.yml 原 publish job：
+#   - 從 CI 拆出（獨立檔案，權限範圍收窄）
+#   - tag pattern 從 `v*` 改為嚴格語意版本（backup / draft tag 不誤觸）
+#   - RC tag 走 TestPyPI（dry run），正式 tag 走 PyPI
+#   - 用 OIDC trusted publishing（`id-token: write`），不再需要 PyPI token secret
+# ======================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      # 嚴格語意版本 + 可選 RC 後綴
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+  # 手動觸發：
+  #   - 預設：`gh workflow run release.yml --ref v<X.Y.Z>`（workflow 檔與 source 都從 tag 讀）
+  #   - 救舊 release：若該 tag commit 的 workflow 檔不含 workflow_dispatch
+  #     （e.g. v0.8.4 rescue），可改成
+  #     `gh workflow run release.yml --ref main -f tag=v0.8.4`
+  #     —— workflow 檔從 main 讀（有 workflow_dispatch），source 則 checkout 到 input.tag。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.8.4). 留空則用觸發的 ref（必為 tag ref）。"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# 避免同個 tag 同時被 tag-push 與 workflow_dispatch 觸發造成重複 publish。
+# 用 effective tag 而非 github.ref 當 group key：tag push (github.ref_name=v0.8.4)
+# 與 rescue dispatch (inputs.tag=v0.8.4, github.ref=refs/heads/main) 都落到同一 group。
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ============ 預檢：tag 與 __version__ 一致性 ============
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      is_rc: ${{ steps.parse.outputs.is_rc }}
+      ref: ${{ steps.parse.outputs.ref }}
+    steps:
+      - name: Resolve & validate release ref
+        id: parse
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          # 優先用 input.tag；否則從 GITHUB_REF 解析（必為 tag ref）。
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            case "$GITHUB_REF" in
+              refs/tags/v*) TAG="${GITHUB_REF#refs/tags/}" ;;
+              *) echo "::error::release.yml must run on a tag ref or be dispatched with 'tag' input, got $GITHUB_REF"; exit 1 ;;
+            esac
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "::error::Tag must match v<X>.<Y>.<Z>[-rcN], got $TAG"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          # 從同一 regex 的 capture group 決定 is_rc，避免 substring match 誤判
+          # （e.g. v1.0.0-rc-foo 這種被鬆散 case glob 放行、又被 *-rc* 誤判的情況）
+          if [[ -n "${BASH_REMATCH[1]}" ]]; then
+            echo "is_rc=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_rc=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG | Version: $VERSION"
+
+      - name: Checkout source at release ref
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ steps.parse.outputs.ref }}
+
+      - name: Verify tag matches __version__
+        run: |
+          TAG_VERSION="${{ steps.parse.outputs.version }}"
+          # 正式 tag：要完全 match；RC tag：允許 __version__ 不含 -rcN（本地 0.8.3 對 tag v0.8.3-rc1）
+          PKG_VERSION=$(python3 -c "
+          import re
+          m = re.search(r'__version__\\s*=\\s*\"([^\"]+)\"', open('csp_lib/__init__.py').read())
+          print(m.group(1))
+          ")
+          EXPECTED="${TAG_VERSION%%-rc*}"
+          if [ "$EXPECTED" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $TAG_VERSION does not match __version__=$PKG_VERSION (expected $EXPECTED)"
+            exit 1
+          fi
+
+  # ============ Pre-publish test (3 OS matrix，發版前最後一道驗證) ============
+  # 為何 tag 後又跑一次 test：
+  #   - PyPI 版本號 immutable，publish 出去後不能撤回，必須在 publish 前確保綠燈
+  #   - 即使 Release PR 階段已驗過，這裡再跑能擋：sync-citation-date 後追 commit
+  #     造成 tag commit 與 PR 驗證 commit 不同的邊界情況
+  #   - 失敗→ publish 不會跑（needs gate），可開 fix PR 後 release-please 自動推下個 patch
+  #     詳見 docs/15-Development/Release Recovery.md
+  test:
+    name: Test on ${{ matrix.os }}
+    needs: [preflight]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v7.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --group dev --all-extras
+
+      - name: Run tests
+        run: uv run python -m pytest tests/ -v -n auto
+
+  # ============ Build sdist + wheel ============
+  build:
+    name: Build dist
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Install build tooling
+        run: pip install build twine
+
+      - name: Build
+        run: |
+          python -m build
+          twine check dist/*
+
+      - name: Upload dist
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        with:
+          name: dist-${{ needs.preflight.outputs.version }}
+          path: dist/
+
+  # ============ Extract release notes from CHANGELOG ============
+  notes:
+    name: Release notes
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    outputs:
+      notes_exist: ${{ steps.extract.outputs.notes_exist }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Extract notes
+        id: extract
+        run: |
+          VERSION="${{ needs.preflight.outputs.version }}"
+          # RC 版本取 base version 的 CHANGELOG section（RC 通常沒有獨立 section）
+          BASE="${VERSION%%-rc*}"
+          python3 - <<PY
+          import re
+          version = "$BASE"
+          content = open('CHANGELOG.md', encoding='utf-8').read()
+          pattern = rf'## \\[{re.escape(version)}\\].*?\\n(.*?)(?=\\n## \\[|\\Z)'
+          m = re.search(pattern, content, re.DOTALL)
+          notes = m.group(1).strip() if m else f'Release {version}'
+          with open('release_notes.md', 'w', encoding='utf-8') as f:
+              f.write(notes)
+          PY
+          if [ -s release_notes.md ]; then
+            echo "notes_exist=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notes_exist=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload notes
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        with:
+          name: release-notes-${{ needs.preflight.outputs.version }}
+          path: release_notes.md
+
+  # ============ Publish RC → TestPyPI ============
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: [preflight, test, build, notes]
+    if: needs.preflight.outputs.is_rc == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/csp0924-lib
+    permissions:
+      id-token: write  # OIDC
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-${{ needs.preflight.outputs.version }}
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+  # ============ Publish Release → PyPI + GitHub Release ============
+  # 雙重 gating：
+  #   1. needs: [preflight, test, build, notes] — 任一 fail 就不會跑
+  #   2. environment: pypi — 在 GitHub repo Settings → Environments → pypi 設
+  #      "Required reviewers" = 自己，可在 publish 前人工 approve（防止 PyPI 燒版本號）
+  #
+  # 失敗恢復流程：見 docs/15-Development/Release Recovery.md
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [preflight, test, build, notes]
+    if: needs.preflight.outputs.is_rc == 'false'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/csp0924-lib
+    permissions:
+      contents: write  # gh-release 需要寫 releases
+      id-token: write  # OIDC for PyPI
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-${{ needs.preflight.outputs.version }}
+          path: dist/
+
+      - name: Download release notes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: release-notes-${{ needs.preflight.outputs.version }}
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        with:
+          packages-dir: dist/
+          attestations: true
+
+      # 用 gh CLI 一次 call 建 release + 附 asset，避開 "先 create 再 upload"
+      # 兩階段流程：GitHub Immutable Releases 會讓 release 建出來就 immutable，
+      # 導致後續 upload asset 失敗（v0.8.3 首次 release 踩到這個坑）。
+      # gh release create 把 assets 當成 positional args 一併帶入 create 請求。
+      #
+      # 救舊 release 情境（release 已存在且 immutable）：create 會 fail，
+      # 這個 step 會 log 警告並放行，讓 PyPI publish 成功的事實成立。
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 此 job 不 checkout，沒有 local git remote 可推斷 repo；顯式提供。
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.preflight.outputs.version }}
+        run: |
+          set -e
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::Release $TAG already exists (likely rescue dispatch); skipping create — immutable releases cannot accept new assets."
+            exit 0
+          fi
+          # attestation 檔已隨 PyPI publish 上 sigstore，GH Release 只附 wheel + sdist
+          gh release create "$TAG" \
+            dist/*.whl dist/*.tar.gz \
+            --title "$TAG" \
+            --notes-file release_notes.md

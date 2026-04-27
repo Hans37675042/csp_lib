@@ -43,8 +43,10 @@ from .config import (
 from .errors import (
     GatewayError,
     RegisterConflictError,
+    RegisterNotWritableError,
     WriteRejectedError,
 )
+from .heartbeat_target import GatewayRegisterHeartbeatTarget
 from .hooks import CallbackHook, RedisPublishHook, StatePersistHook
 from .protocol import (
     DataSyncSource,
@@ -53,6 +55,12 @@ from .protocol import (
     WriteValidator,
 )
 from .register_map import GatewayRegisterMap
+from .registry_sync_source import (
+    AggregateCallable,
+    AggregateFunc,
+    RegisterAggregateMapping,
+    RegistryAggregatingSource,
+)
 from .server import ModbusGatewayServer
 from .sync_sources import PollingCallbackSource, RedisSubscriptionSource
 from .validators import AddressWhitelistValidator
@@ -62,6 +70,7 @@ __all__ = [
     # Errors
     "GatewayError",
     "RegisterConflictError",
+    "RegisterNotWritableError",
     "WriteRejectedError",
     # Config
     "RegisterType",
@@ -88,4 +97,10 @@ __all__ = [
     # Sync Sources
     "RedisSubscriptionSource",
     "PollingCallbackSource",
+    "RegistryAggregatingSource",
+    "RegisterAggregateMapping",
+    "AggregateFunc",
+    "AggregateCallable",
+    # Heartbeat target
+    "GatewayRegisterHeartbeatTarget",
 ]

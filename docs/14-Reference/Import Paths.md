@@ -3,8 +3,8 @@ tags:
   - type/reference
   - status/complete
 created: 2026-02-17
-updated: 2026-04-05
-version: ">=0.7.0"
+updated: 2026-04-20
+version: ">=0.9.0"
 
 ---
 
@@ -254,6 +254,8 @@ from csp_lib.controller import (
     # 核心
     Command, SystemBase, StrategyContext,
     Strategy, ExecutionConfig, ExecutionMode, ConfigMixin,
+    # NO_CHANGE sentinel（v0.8.0）
+    NoChange, NO_CHANGE, is_no_change,
     # 命令處理管線（v0.5.1）
     CommandProcessor,
     # 校準（v0.5.1）
@@ -354,6 +356,43 @@ from csp_lib.integration import (
     DeviceDataFeed,
     # 心跳服務（v0.4.2）
     HeartbeatService,
+    # 心跳配置與 Protocol（v0.8.1）
+    HeartbeatConfig,                          # v0.8.1 — 結構化心跳配置
+    HeartbeatValueGenerator,                  # v0.8.1 — 值產生器 Protocol
+    ToggleGenerator,                          # v0.8.1
+    IncrementGenerator,                       # v0.8.1
+    ConstantGenerator,                        # v0.8.1
+    HeartbeatTarget,                          # v0.8.1 — 寫入目標 Protocol
+    DeviceHeartbeatTarget,                    # v0.8.1
+    # 命令刷新（v0.8.1）
+    CommandRefreshService,                    # v0.8.1 — reconciler 服務
+    CommandRefreshConfig,                     # v0.8.1 — reconciler 配置
+    # Reconciler Protocol（v0.9.0）
+    Reconciler,                               # v0.9.0 — @runtime_checkable Reconciler Protocol
+    ReconcilerStatus,                         # v0.9.0 — reconcile 執行狀態 frozen dataclass
+    # TypeRegistry（v0.9.0）
+    TypeRegistry,                             # v0.9.0 — Generic[T] kind → class 映射表
+    device_type_registry,                     # v0.9.0 — 全域設備型別 singleton
+    strategy_type_registry,                   # v0.9.0 — 全域策略型別 singleton
+    register_device_type,                     # v0.9.0 — @register_device_type("kind") decorator
+    register_strategy_type,                   # v0.9.0 — @register_strategy_type("kind") decorator
+    # Site Manifest（v0.9.0）
+    SiteManifest,                             # v0.9.0 — 站點宣告式配置 frozen dataclass
+    ManifestMetadata,                         # v0.9.0 — metadata 段落 frozen dataclass
+    SiteSpec,                                 # v0.9.0 — spec 段落 frozen dataclass
+    DeviceSpec,                               # v0.9.0 — 單一設備規格 frozen dataclass
+    StrategySpec,                             # v0.9.0 — 單一策略規格 frozen dataclass
+    ReconcilerSpec,                           # v0.9.0 — 單一 reconciler 規格 frozen dataclass
+    load_manifest,                            # v0.9.0 — 載入 YAML/dict 回傳 SiteManifest
+    # ManifestBinder（v0.9.0）
+    BoundDeviceSpec,                          # v0.9.0 — 繫結後的設備規格 frozen dataclass
+    BoundStrategySpec,                        # v0.9.0 — 繫結後的策略規格 frozen dataclass
+    BoundReconcilerSpec,                      # v0.9.0 — 繫結後的 reconciler 規格 frozen dataclass
+    ManifestBindResult,                       # v0.9.0 — apply_manifest_to_builder 回傳結果
+    apply_manifest_to_builder,                # v0.9.0 — 把 SiteManifest 繫結到 Builder
+    # SetpointDriftReconciler（v0.9.0）
+    DriftTolerance,                           # v0.9.0 — setpoint drift 容忍範圍 frozen dataclass
+    SetpointDriftReconciler,                  # v0.9.0 — 偵測並修正 setpoint drift 的 Reconciler
     # 功率分配器（v0.4.2）
     DeviceSnapshot,
     PowerDistributor,
@@ -374,6 +413,14 @@ from csp_lib.integration import (
     DeviceStateSubscriber, RemoteCommandRouter,
     DistributedController, RemoteSiteRunner,
 )
+```
+
+### 型別別名（直接從子模組 import）
+
+```python
+# v0.8.2 — 型別別名未包含在頂層 csp_lib.integration 的 __all__
+from csp_lib.integration.registry import StatusChangeCallback   # Callable[[str, bool], None]
+from csp_lib.integration.distributor import SOCSource           # Callable[[DeviceSnapshot], float | None]
 ```
 
 ### Hierarchical Control（v0.6.0）
@@ -401,8 +448,51 @@ from csp_lib.mongo import (
     MongoBatchUploader,
     UploaderConfig,
     WriteResult,
+    # 本地緩衝（v0.8.2）
+    LocalBufferedUploader,
+    LocalBufferConfig,
+    LocalBufferStore,          # v0.8.2 — backend-agnostic Protocol（@runtime_checkable）
+    BufferedRow,               # v0.8.2 — fetch_pending 回傳的 frozen dataclass
+    SqliteBufferStore,         # v0.8.2 — aiosqlite 實作，需 csp_lib[local-buffer]
+    MongoBufferStore,          # v0.8.2 — 本地 mongod 實作，已含於 csp_lib[mongo]
 )
 ```
+
+### 本地緩衝（Local Buffer，v0.8.2）
+
+`LocalBufferedUploader` 本身只需 `csp_lib[mongo]`；backend 視部署場景選擇：
+
+```bash
+uv pip install 'csp0924_lib[mongo]'               # MongoBufferStore（本地 mongod backend）
+uv pip install 'csp0924_lib[local-buffer]'        # SqliteBufferStore（aiosqlite）
+uv pip install 'csp0924_lib[mongo,local-buffer]'  # 兩種 backend 都可用
+```
+
+```python
+# 完整用法（SqliteBufferStore backend）
+from csp_lib.mongo import (
+    LocalBufferedUploader,     # v0.8.2 — 本地緩衝 + 背景 replay
+    LocalBufferConfig,         # v0.8.2 — replay / cleanup 行為配置（不含 db_path）
+    LocalBufferStore,          # v0.8.2 — @runtime_checkable Protocol
+    BufferedRow,               # v0.8.2 — 單筆資料快照 frozen dataclass
+    SqliteBufferStore,         # v0.8.2 — aiosqlite WAL 實作，需 csp_lib[local-buffer]
+    MongoBufferStore,          # v0.8.2 — 本地 mongod 實作，已含於 csp_lib[mongo]
+)
+
+# 或從子模組 import（等價）
+from csp_lib.mongo.local_buffer import (
+    LocalBufferedUploader,
+    LocalBufferConfig,
+    LocalBufferStore,
+    BufferedRow,
+    SqliteBufferStore,
+    MongoBufferStore,          # v0.8.2
+)
+```
+
+> [!note] v0.8.2 extras 異動
+> `[mongo]` 已瘦身為純 `motor>=3.3.0`；`aiosqlite` 移至獨立 `[local-buffer]` extra。
+> 詳見 [[LocalBufferedUploader#安裝需求]]。
 
 ---
 
@@ -468,6 +558,24 @@ from csp_lib.notification import (
 
 ---
 
+## Alarm (`csp_lib.alarm`，v0.8.2)
+
+```python
+from csp_lib.alarm import (
+    AlarmAggregator,            # OR 聚合器
+    WatchdogProtocol,           # Watchdog 結構化協定（@runtime_checkable）
+    AlarmChangeCallback,        # Callable[[bool], None] 型別別名
+)
+
+# 需安裝：pip install "csp0924_lib[redis]"
+from csp_lib.alarm import (
+    RedisAlarmPublisher,        # aggregator.on_change → Redis publish
+    RedisAlarmSource,           # Redis subscribe → aggregator.mark_source
+)
+```
+
+---
+
 ## Modbus Gateway（v0.6.0）
 
 ```python
@@ -476,6 +584,7 @@ from csp_lib.modbus_gateway import (
     GatewayError,
     RegisterConflictError,
     WriteRejectedError,
+    RegisterNotWritableError,          # v0.7.3 SEC-006
     # Config
     RegisterType,
     GatewayRegisterDef,
@@ -501,6 +610,13 @@ from csp_lib.modbus_gateway import (
     # Sync Sources
     RedisSubscriptionSource,
     PollingCallbackSource,
+    # Registry 聚合同步（v0.8.2）
+    RegistryAggregatingSource,         # v0.8.2 — DeviceRegistry trait 聚合寫入 register
+    RegisterAggregateMapping,          # v0.8.2 — 聚合映射 frozen dataclass
+    AggregateFunc,                     # v0.8.2 — AVERAGE / SUM / MIN / MAX
+    AggregateCallable,                 # v0.8.2 — Callable[[list[float]], float] 型別別名
+    # HeartbeatTarget 實作（v0.8.1）
+    GatewayRegisterHeartbeatTarget,    # v0.8.1 — 對 ModbusGatewayServer register 寫心跳值
 )
 ```
 

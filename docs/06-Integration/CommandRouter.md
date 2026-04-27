@@ -4,8 +4,9 @@ tags:
   - layer/integration
   - status/complete
 source: csp_lib/integration/command_router.py
-updated: 2026-04-04
-version: ">=0.4.2"
+created: 2026-02-17
+updated: 2026-04-17
+version: ">=0.8.1"
 ---
 
 # CommandRouter
@@ -27,6 +28,7 @@ Command → 設備寫入路由器，隸屬於 [[_MOC Integration|Integration 模
 
 | 情境 | 處理方式 |
 |------|---------|
+| command 欄位值為 `NO_CHANGE` | TRACE log + 跳過該軸的所有設備寫入（v0.8.0） |
 | `transform` 例外 | log error + 跳過該映射 |
 | 單一設備寫入失敗 | log warning + 繼續寫入其他設備 |
 | 設備不存在或離線 | log warning + 跳過 |
@@ -59,6 +61,17 @@ Command → 設備寫入路由器，隸屬於 [[_MOC Integration|Integration 模
 |------|------|
 | `route(command) → None` | 遍歷所有映射（明確 + capability），取得 Command 對應欄位值後寫入設備 |
 | `route_per_device(command, per_device_commands) → None` | 明確映射用系統級 command，capability 映射用 per-device command |
+| `try_write_single(device_id, point_name, value) → bool` | v0.8.1+：公開單設備寫入；成功更新 `_last_written` desired state；失敗回傳 `False` |
+| `get_last_written(device_id) → dict[str, Any]` | v0.8.1+：回傳指定設備的 desired state snapshot（`point_name → value`） |
+| `get_tracked_device_ids() → frozenset[str]` | v0.8.1+：回傳所有已追蹤的 device_id 集合 |
+
+### Desired State 追蹤（v0.8.1 新增）
+
+`CommandRouter` 從 v0.8.1 起維護 `_last_written: dict[str, dict[str, Any]]`，每次成功寫入後更新。此 desired state 表供 [[Command Refresh|CommandRefreshService]] 週期性讀取並重傳，實現 reconciler 模型。
+
+- `NO_CHANGE` 軸跳過寫入，**不**觸及 `_last_written`，保留業務值語義
+- `is_protected` / `is_responsive` 等保護條件不通過時，`_last_written` 也不更新
+- `try_write_single` 與舊版 `_write_single` 邏輯等效（`_write_single` 現在是 alias）
 
 ## Per-Device 分配模式
 
@@ -99,6 +112,9 @@ await router.route(command)  # 同值廣播
 await router.route_per_device(command, per_device_commands)
 ```
 
+> [!note] v0.8.0 NO_CHANGE 支援
+> `route()` 與 `route_per_device()` 在讀取 Command 欄位後，若值為 `NO_CHANGE` sentinel，立即跳過該映射下的所有設備寫入並記錄 TRACE log。這讓 QV 策略（`p=NO_CHANGE`）或 FP 策略（`q=NO_CHANGE`）可正確與其他策略組合，不會將「跳過」誤傳為寫入 0。
+
 ## 相關頁面
 
 - [[CommandMapping]] — 明確映射定義
@@ -107,4 +123,6 @@ await router.route_per_device(command, per_device_commands)
 - [[PowerDistributor]] — 提供 per-device Command 給 `route_per_device()`
 - [[GridControlLoop]] — 使用 CommandRouter 作為 on_command 回呼
 - [[SystemController]] — 在 ProtectionGuard 之後使用 CommandRouter
+- [[Command]] — v0.8.0 起 p_target / q_target 支援 NO_CHANGE
 - [[CapabilityBinding Integration]] — 完整架構與流程圖
+- [[Command Refresh]] — CommandRefreshService：讀取 desired state 並週期重傳（v0.8.1）

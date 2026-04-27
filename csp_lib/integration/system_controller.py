@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from csp_lib.controller.core import (
@@ -42,12 +44,15 @@ from csp_lib.core import AsyncLifecycleMixin, get_logger
 from csp_lib.core.errors import ConfigurationError
 from csp_lib.core.health import HealthReport, HealthStatus
 from csp_lib.core.runtime_params import RuntimeParameters
+from csp_lib.equipment.device import EVENT_READ_COMPLETE
 
+from .command_refresh import CommandRefreshService
 from .command_router import CommandRouter
 from .context_builder import ContextBuilder
 from .data_feed import DeviceDataFeed
 from .distributor import DeviceSnapshot, PowerDistributor
 from .heartbeat import HeartbeatService
+from .heartbeat_targets import HeartbeatTarget
 from .orchestrator import SystemCommandOrchestrator
 from .registry import DeviceRegistry
 from .schema import (
@@ -65,10 +70,55 @@ if TYPE_CHECKING:
     from csp_lib.controller.core import Strategy
     from csp_lib.equipment.device import AsyncModbusDevice
 
+    from .manifest import SiteManifest
+    from .type_registry import TypeRegistry
+
 logger = get_logger(__name__)
 
 _AUTO_STOP_MODE = "__auto_stop__"
 _SCHEDULE_MODE = "__schedule__"
+
+
+@dataclass(frozen=True, slots=True)
+class CommandRefreshConfig:
+    """CommandRefreshService 的配置（v0.8.1 新增）
+
+    Attributes:
+        refresh_interval: reconcile 週期（秒）。預設 1.0。
+        enabled: 是否啟用；False 時 SystemController 不建立 service。
+        device_filter: 若提供，只 reconcile 這些 device_id；None 代表全部。
+    """
+
+    refresh_interval: float = 1.0
+    enabled: bool = False
+    device_filter: frozenset[str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HeartbeatConfig:
+    """心跳服務的配置（v0.8.1 新增）
+
+    將舊的 6 個 ``heartbeat_*`` 欄位收攏到同一個 config object；新舊欄位
+    並存一段時間，舊欄位在 v1.0.0 將被移除。
+
+    Attributes:
+        mappings: 明確的 ``HeartbeatMapping`` 列表。
+        interval_seconds: 心跳寫入週期（秒）。
+        use_capability: 是否啟用能力發現模式（HEARTBEAT capability）。
+        capability_mode: 能力發現模式使用的值模式。
+        capability_constant_value: CONSTANT 模式的固定寫入值。
+        capability_increment_max: INCREMENT 模式的最大值。
+        targets: 獨立的 ``HeartbeatTarget`` 列表（例如 Modbus Gateway
+            register target），不經 DeviceRegistry。
+    """
+
+    mappings: list[HeartbeatMapping] = field(default_factory=list)
+    interval_seconds: float = 1.0
+    use_capability: bool = False
+    capability_mode: HeartbeatMode = HeartbeatMode.TOGGLE
+    capability_constant_value: int = 1
+    capability_increment_max: int = 65535
+    targets: list[HeartbeatTarget] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +164,9 @@ class SystemControllerConfig:
     system_alarm_key: str = "system_alarm"
     capacity_kva: float | None = None
     alarm_mode: str = "system_wide"
+    # alarm callback 維持 AsyncModbusDevice 型別：alarm subsystem 目前僅由 Modbus 實作，
+    # 放寬到 DeviceProtocol 會使 `Callable[[AsyncModbusDevice], ...]` 使用者的 type
+    # 賦值失敗（Callable 參數 contravariant）。未來若 CAN/其他設備也有 alarm，再評估。
     on_device_alarm: Callable[[AsyncModbusDevice], Awaitable[None]] | None = None
     on_device_alarm_clear: Callable[[AsyncModbusDevice], Awaitable[None]] | None = None
     heartbeat_mappings: list[HeartbeatMapping] = field(default_factory=list)
@@ -127,6 +180,20 @@ class SystemControllerConfig:
     runtime_params: RuntimeParameters | None = None  # 自動注入到 StrategyContext.params
     capability_requirements: list[CapabilityRequirement] = field(default_factory=list)
     strict_capability_check: bool = False
+    trigger_on_read_device_ids: list[str] = field(default_factory=list)
+    """v0.8.0+：啟動時自動對這些 device_id 註冊 EVENT_READ_COMPLETE 觸發 executor。
+
+    配合 TRIGGERED / HYBRID 策略使用：設備一讀完就立刻觸發策略執行，
+    避免時間錨式 PERIODIC 與 ReadScheduler 之間的 phase drift。
+    """
+
+    heartbeat: HeartbeatConfig | None = None
+    """新版結構化心跳配置。若提供，優先於上方 heartbeat_* 六個舊欄位。
+    舊欄位預計於 v1.0.0 移除。"""
+
+    command_refresh: CommandRefreshConfig | None = None
+    """命令刷新（reconciler）服務配置。``enabled=True`` 時 SystemController
+    會自動建立並隨生命週期啟停 CommandRefreshService。"""
 
     @classmethod
     def builder(cls) -> "SystemControllerConfigBuilder":
@@ -181,6 +248,15 @@ class SystemControllerConfigBuilder:
         self._runtime_params: RuntimeParameters | None = None
         self._capability_requirements: list[CapabilityRequirement] = []
         self._strict_capability_check: bool = False
+        self._trigger_on_read_device_ids: list[str] = []
+        self._heartbeat_config: HeartbeatConfig | None = None
+        self._command_refresh_config: CommandRefreshConfig | None = None
+
+        # Operator Pattern — 由 from_manifest 填入，否則保持初始空值
+        self._manifest_source: SiteManifest | None = None
+        self._manifest_devices: tuple[Any, ...] = ()
+        self._manifest_strategies: tuple[Any, ...] = ()
+        self._manifest_reconcilers: tuple[Any, ...] = ()
 
     # ─────────────── 系統基準 ───────────────
 
@@ -198,18 +274,21 @@ class SystemControllerConfigBuilder:
         *,
         device_id: str | None = None,
         trait: str | None = None,
+        param_key: str | None = None,
         aggregate: Any = None,
         default: Any = None,
         transform: Callable | None = None,
     ) -> "SystemControllerConfigBuilder":
         """
-        新增 context mapping（設備讀值 → StrategyContext）
+        新增 context mapping（設備讀值 / RuntimeParameters → StrategyContext）
 
         Args:
-            point_name: 設備點位名稱
+            point_name: 設備點位名稱（param_key 模式下不會被用到，但為相容仍需提供）
             target: context 欄位（如 "soc", "extra.frequency"）
-            device_id: 指定設備（與 trait 二擇一）
-            trait: 設備群組（與 device_id 二擇一）
+            device_id: 指定設備（與 trait / param_key 三擇一）
+            trait: 設備群組（與 device_id / param_key 三擇一）
+            param_key: v0.8.0+ 新增。從 RuntimeParameters 讀值的 key
+                （與 device_id / trait 三擇一）
             aggregate: 多設備聚合函式（trait 模式用）
             default: 無值時的預設
             transform: 值轉換函式
@@ -219,6 +298,8 @@ class SystemControllerConfigBuilder:
             kwargs["device_id"] = device_id
         if trait is not None:
             kwargs["trait"] = trait
+        if param_key is not None:
+            kwargs["param_key"] = param_key
         if aggregate is not None:
             kwargs["aggregate"] = aggregate
         if default is not None:
@@ -309,17 +390,61 @@ class SystemControllerConfigBuilder:
 
     def heartbeat(
         self,
-        mappings: list[HeartbeatMapping] | None = None,
+        mappings: list[HeartbeatMapping] | HeartbeatConfig | None = None,
         interval: float = 1.0,
         use_capability: bool = False,
         mode: HeartbeatMode = HeartbeatMode.TOGGLE,
     ) -> "SystemControllerConfigBuilder":
-        """設定心跳服務"""
+        """設定心跳服務
+
+        支援兩種呼叫方式：
+
+        1. **Legacy kwargs**（v0.8.0 行為）::
+
+            builder.heartbeat(mappings=[...], interval=1.0, use_capability=False)
+
+        2. **v0.8.1 新 API — 傳入 ``HeartbeatConfig``**::
+
+            builder.heartbeat(HeartbeatConfig(mappings=[...], targets=[...]))
+
+        兩種方式不可混用（傳入 HeartbeatConfig 時會忽略其他 kwargs）。
+        """
+        if isinstance(mappings, HeartbeatConfig):
+            self._heartbeat_config = mappings
+            return self
+
         if mappings:
             self._heartbeat_mappings = mappings
         self._heartbeat_interval = interval
         self._use_heartbeat_capability = use_capability
         self._heartbeat_capability_mode = mode
+        return self
+
+    # ─────────────── Command Refresh ───────────────
+
+    def command_refresh(
+        self,
+        *,
+        interval_seconds: float = 1.0,
+        enabled: bool = True,
+        devices: list[str] | None = None,
+    ) -> "SystemControllerConfigBuilder":
+        """啟用命令刷新服務
+
+        啟用後，SystemController 會每 ``interval_seconds`` 秒把
+        CommandRouter 追蹤的最新寫入值重新推到設備（reconciler 模型）。
+
+        Args:
+            interval_seconds: reconcile 週期（秒），預設 1.0。
+            enabled: 是否啟用；False 時不建立服務。
+            devices: 若提供，只 reconcile 這些 device_id；None 代表全部。
+        """
+        device_filter: frozenset[str] | None = frozenset(devices) if devices else None
+        self._command_refresh_config = CommandRefreshConfig(
+            refresh_interval=interval_seconds,
+            enabled=enabled,
+            device_filter=device_filter,
+        )
         return self
 
     # ─────────────── 告警模式 ───────────────
@@ -360,6 +485,104 @@ class SystemControllerConfigBuilder:
         self._strict_capability_check = enabled
         return self
 
+    # ─────────────── Read-Complete Trigger ───────────────
+
+    def trigger_on_read_complete(self, device_id: str) -> "SystemControllerConfigBuilder":
+        """v0.8.0+：啟動時自動對 ``device_id`` 的 ``EVENT_READ_COMPLETE`` 事件
+        註冊 executor 觸發。
+
+        配合 TRIGGERED / HYBRID 策略使用，達成「設備讀完即觸發策略」的低延遲流程，
+        避免時間錨式 PERIODIC 與 ReadScheduler 之間的 phase drift。
+
+        可多次呼叫新增多台設備；重複的 device_id 在 build 時不過濾，但 attach 階段
+        會 fail-fast 拋 ``ValueError``。
+
+        Args:
+            device_id: 要監聽的設備 ID（需於 ``SystemController`` 啟動時
+                已註冊到 ``DeviceRegistry``）。
+        """
+        self._trigger_on_read_device_ids.append(device_id)
+        return self
+
+    # ─────────────── Manifest ───────────────
+
+    @classmethod
+    def from_manifest(
+        cls,
+        manifest: "SiteManifest | str | Path | Mapping[str, Any]",
+        *,
+        device_registry: "TypeRegistry[AsyncModbusDevice] | None" = None,
+        strategy_registry: "TypeRegistry[Strategy] | None" = None,
+    ) -> "SystemControllerConfigBuilder":
+        """從 SiteManifest 建構 builder（可再 chain 既有 fluent methods 覆寫）。
+
+        此 classmethod 是 Operator Pattern 基礎的 YAML-driven 入口。
+        解析後的 devices / strategies / 未處理的 reconcilers 儲存在 builder
+        的 ``manifest_devices`` / ``manifest_strategies`` / ``manifest_reconcilers``
+        唯讀 properties，供 SystemController 啟動流程或後續 fluent chain 使用。
+
+        已知的 builtin reconciler kind（例如 ``CommandRefresh``）會直接呼叫
+        對應的 fluent method（``self.command_refresh(**config)``）；未知 kind
+        保留在 ``manifest_reconcilers`` 留給後續處理。
+
+        Args:
+            manifest:          SiteManifest 實例、YAML 路徑、或已 parse 的 dict
+            device_registry:   未傳時用 module-level ``device_type_registry``
+            strategy_registry: 同上（strategy）
+
+        Returns:
+            已依 manifest 預填的 SystemControllerConfigBuilder 實例
+
+        Raises:
+            ConfigurationError: manifest 內 kind 查無對應 class，或 builtin
+                                reconciler 的 config kwargs 不被 builder 接受
+
+        Example::
+
+            builder = SystemControllerConfigBuilder.from_manifest("site.yaml")
+            config = builder.protect(extra_rule).build()  # 可再 chain
+        """
+        # Lazy import 避免 module-level 循環（manifest / manifest_binder →
+        # type_registry → TYPE_CHECKING 回引本模組）
+        from .manifest import SiteManifest, load_manifest
+        from .manifest_binder import apply_manifest_to_builder
+
+        if not isinstance(manifest, SiteManifest):
+            manifest = load_manifest(manifest)
+
+        builder = cls()
+        result = apply_manifest_to_builder(
+            builder,
+            manifest,
+            device_registry=device_registry,
+            strategy_registry=strategy_registry,
+        )
+        builder._manifest_source = manifest
+        builder._manifest_devices = result.devices
+        builder._manifest_strategies = result.strategies
+        builder._manifest_reconcilers = result.reconcilers
+        return builder
+
+    @property
+    def manifest_source(self) -> "SiteManifest | None":
+        """若此 builder 由 ``from_manifest`` 建立，回傳原始 manifest。"""
+        return self._manifest_source
+
+    @property
+    def manifest_devices(self) -> tuple[Any, ...]:
+        """manifest 解析出的 BoundDeviceSpec 序列（可能為空）。"""
+        return self._manifest_devices
+
+    @property
+    def manifest_strategies(self) -> tuple[Any, ...]:
+        """manifest 解析出的 BoundStrategySpec 序列（可能為空）。"""
+        return self._manifest_strategies
+
+    @property
+    def manifest_reconcilers(self) -> tuple[Any, ...]:
+        """manifest 中未被 builder builtin 消化的 BoundReconcilerSpec 序列。"""
+        return self._manifest_reconcilers
+
     # ─────────────── Build ───────────────
 
     def build(self) -> "SystemControllerConfig":
@@ -390,6 +613,9 @@ class SystemControllerConfigBuilder:
             runtime_params=self._runtime_params,
             capability_requirements=self._capability_requirements,
             strict_capability_check=self._strict_capability_check,
+            trigger_on_read_device_ids=self._trigger_on_read_device_ids,
+            heartbeat=self._heartbeat_config,
+            command_refresh=self._command_refresh_config,
         )
 
 
@@ -460,9 +686,22 @@ class SystemController(AsyncLifecycleMixin):
         # 系統指令編排器
         self._orchestrator = SystemCommandOrchestrator(registry)
 
-        # 心跳服務（可選）
+        # 心跳服務（可選）：config.heartbeat 優先，否則 fallback 至舊 6 個 heartbeat_* 欄位
         self._heartbeat: HeartbeatService | None = None
-        if config.heartbeat_mappings or config.use_heartbeat_capability:
+        if config.heartbeat is not None:
+            hb_cfg = config.heartbeat
+            if hb_cfg.mappings or hb_cfg.use_capability or hb_cfg.targets:
+                self._heartbeat = HeartbeatService(
+                    registry,
+                    mappings=hb_cfg.mappings or None,
+                    interval=hb_cfg.interval_seconds,
+                    use_capability=hb_cfg.use_capability,
+                    mode=hb_cfg.capability_mode,
+                    constant_value=hb_cfg.capability_constant_value,
+                    increment_max=hb_cfg.capability_increment_max,
+                    targets=hb_cfg.targets or None,
+                )
+        elif config.heartbeat_mappings or config.use_heartbeat_capability:
             self._heartbeat = HeartbeatService(
                 registry,
                 mappings=config.heartbeat_mappings or None,
@@ -471,6 +710,15 @@ class SystemController(AsyncLifecycleMixin):
                 mode=config.heartbeat_capability_mode,
                 constant_value=config.heartbeat_capability_constant_value,
                 increment_max=config.heartbeat_capability_increment_max,
+            )
+
+        # CommandRefreshService（可選）：enabled 才建立
+        self._command_refresh: CommandRefreshService | None = None
+        if config.command_refresh is not None and config.command_refresh.enabled:
+            self._command_refresh = CommandRefreshService(
+                self._command_router,
+                interval=config.command_refresh.refresh_interval,
+                device_filter=config.command_refresh.device_filter,
             )
 
         # 策略執行器：context_provider 與 on_command 由本控制器管理
@@ -492,6 +740,10 @@ class SystemController(AsyncLifecycleMixin):
 
         # 背景任務
         self._run_task: asyncio.Task[None] | None = None
+
+        # Read-complete auto-trigger 狀態追蹤
+        self._read_trigger_devices: set[str] = set()
+        self._auto_trigger_detachers: list[Callable[[], None]] = []
 
         # 註冊自動停機模式（通過 EventDrivenOverride 機制）
         if config.auto_stop_on_alarm:
@@ -607,27 +859,112 @@ class SystemController(AsyncLifecycleMixin):
         """手動觸發策略執行"""
         self._executor.trigger()
 
+    def attach_read_trigger(self, device_id: str) -> Callable[[], None]:
+        """v0.8.0+：將指定設備的 ``EVENT_READ_COMPLETE`` 綁定為 executor 的觸發源。
+
+        每次該設備完成一輪讀取就呼叫 ``self._executor.trigger()``，達成
+        「讀完即執行策略」。適用於 TRIGGERED / HYBRID 模式策略，避免時間錨式
+        PERIODIC 與 ReadScheduler 之間的 phase drift。
+
+        Args:
+            device_id: 要綁定的設備 ID（必須已註冊於 DeviceRegistry）。
+
+        Returns:
+            detacher callable — 呼叫即解除綁定。``_on_stop`` 會自動呼叫所有自動
+            attach 產生的 detacher，應用端通常不需手動呼叫。
+
+        Raises:
+            ValueError: 設備未註冊於 registry；或該 device_id 已經被 attach
+                （重複 attach fail-fast，避免重複觸發）。
+        """
+        device = self._registry.get_device(device_id)
+        if device is None:
+            raise ValueError(f"Device '{device_id}' not found in registry")
+        if device_id in self._read_trigger_devices:
+            raise ValueError(f"Read trigger already attached for device '{device_id}'")
+
+        async def _on_read_complete(_payload: Any) -> None:
+            self._executor.trigger()
+
+        base_detacher = device.on(EVENT_READ_COMPLETE, _on_read_complete)
+        self._read_trigger_devices.add(device_id)
+
+        def _wrapped_detacher() -> None:
+            self._read_trigger_devices.discard(device_id)
+            base_detacher()
+
+        logger.debug(f"Read-complete trigger attached for device '{device_id}'")
+        return _wrapped_detacher
+
     # ---- 生命週期 ----
 
     async def _on_start(self) -> None:
-        """啟動系統控制器"""
-        # Preflight: 驗證能力需求
-        self.preflight_check()
+        """啟動系統控制器
 
-        # 初始化 post-protection processors（async_init for MongoDB etc.）
-        for proc in self._config.post_protection_processors:
-            if hasattr(proc, "async_init"):
-                await proc.async_init()
-        if self._data_feed is not None:
-            self._data_feed.attach()
-        if self._heartbeat is not None:
-            self._validate_heartbeat_points()
-            await self._heartbeat.start()
-        self._run_task = asyncio.create_task(self._executor.run())
-        logger.info("SystemController started.")
+        中途失敗時呼叫 ``_on_stop()`` 清理已啟動的元件（data_feed、command_refresh、
+        heartbeat、_run_task、auto_trigger_detachers），再 re-raise。避免 PEP 492
+        ``async with`` 模式下 ``__aenter__`` 拋異常後 ``__aexit__`` 不會被呼叫所導致
+        的資源洩漏。
+        """
+        try:
+            # Preflight: 驗證能力需求
+            self.preflight_check()
+
+            # 初始化 post-protection processors（async_init for MongoDB etc.）
+            for proc in self._config.post_protection_processors:
+                if hasattr(proc, "async_init"):
+                    await proc.async_init()
+            if self._data_feed is not None:
+                self._data_feed.attach()
+            # command_refresh 先於 heartbeat 啟動：避免 heartbeat pause/resume 干擾首輪 reconcile
+            if self._command_refresh is not None:
+                await self._command_refresh.start()
+            if self._heartbeat is not None:
+                self._validate_heartbeat_points()
+                await self._heartbeat.start()
+            self._run_task = asyncio.create_task(self._executor.run())
+
+            # 依配置 auto-attach read-complete 觸發。ValueError（如設備不存在）僅警告；
+            # 其他例外回滾已 attach 的 detacher 避免孤兒 handler，再 re-raise。
+            for device_id in self._config.trigger_on_read_device_ids:
+                try:
+                    detacher = self.attach_read_trigger(device_id)
+                    self._auto_trigger_detachers.append(detacher)
+                except ValueError as exc:
+                    logger.warning(f"Failed to auto-attach read trigger for '{device_id}': {exc}")
+                except Exception:
+                    logger.opt(exception=True).error(
+                        f"Unexpected error attaching read trigger for '{device_id}'; rolling back partial attaches"
+                    )
+                    for already_attached in self._auto_trigger_detachers:
+                        try:
+                            already_attached()
+                        except Exception:
+                            logger.opt(exception=True).warning("Rollback detacher raised")
+                    self._auto_trigger_detachers.clear()
+                    raise
+
+            logger.info("SystemController started.")
+        except Exception:
+            # 僅處理 Exception：CancelledError/KeyboardInterrupt/SystemExit 不做 rollback
+            # （中止訊號下繼續 await 另一個 coroutine 會再拋 CancelledError，遮蔽原例外）。
+            logger.opt(exception=True).warning("SystemController._on_start failed; rolling back partial startup.")
+            try:
+                await self._on_stop()
+            except Exception:
+                logger.opt(exception=True).warning("SystemController rollback _on_stop also failed.")
+            raise
 
     async def _on_stop(self) -> None:
         """停止系統控制器"""
+        # 先 detach read-complete trigger，避免停機過程再觸發 executor
+        for detacher in self._auto_trigger_detachers:
+            try:
+                detacher()
+            except Exception:
+                logger.opt(exception=True).warning("Read trigger detacher raised")
+        self._auto_trigger_detachers.clear()
+
         try:
             self._executor.stop()
             if self._run_task is not None:
@@ -638,25 +975,44 @@ class SystemController(AsyncLifecycleMixin):
                 if self._heartbeat is not None:
                     await self._heartbeat.stop()
             finally:
-                if self._data_feed is not None:
-                    self._data_feed.detach()
+                try:
+                    # 反向啟動順序：command_refresh 在 heartbeat 之後停止
+                    if self._command_refresh is not None:
+                        await self._command_refresh.stop()
+                finally:
+                    if self._data_feed is not None:
+                        self._data_feed.detach()
         logger.info("SystemController stopped.")
 
     def _validate_heartbeat_points(self) -> None:
-        """驗證心跳映射的 point_name 是否存在於目標設備（僅 warning，不中斷啟動）"""
-        for mapping in self._config.heartbeat_mappings:
+        """驗證心跳映射的 point_name 是否存在於目標設備（僅 warning，不中斷啟動）
+
+        ``target`` 模式的 mapping 跳過設備點位驗證 — target 可寫到非 device 目標
+        （如 Gateway register），不在 DeviceRegistry 範圍內。
+        """
+        if self._config.heartbeat is not None:
+            mappings = self._config.heartbeat.mappings
+        else:
+            mappings = self._config.heartbeat_mappings
+
+        for mapping in mappings:
+            if mapping.target is not None:
+                continue
             if mapping.device_id is not None:
                 device = self._registry.get_device(mapping.device_id)
-                if device is not None and mapping.point_name not in device.all_point_names:
-                    logger.warning(
-                        "Heartbeat point '{}' not found on device '{}'.",
-                        mapping.point_name,
-                        mapping.device_id,
-                    )
+                if device is not None:
+                    point_names: set[str] = getattr(device, "all_point_names", set())
+                    if mapping.point_name not in point_names:
+                        logger.warning(
+                            "Heartbeat point '{}' not found on device '{}'.",
+                            mapping.point_name,
+                            mapping.device_id,
+                        )
             elif mapping.trait is not None:
                 devices = self._registry.get_devices_by_trait(mapping.trait)
                 for device in devices:
-                    if mapping.point_name not in device.all_point_names:
+                    trait_point_names: set[str] = getattr(device, "all_point_names", set())
+                    if mapping.point_name not in trait_point_names:
                         logger.warning(
                             "Heartbeat point '{}' not found on device '{}' (trait='{}').",
                             mapping.point_name,
@@ -770,15 +1126,19 @@ class SystemController(AsyncLifecycleMixin):
                 # 新增告警設備
                 self._alarmed_devices.add(device_id)
                 if self._config.on_device_alarm is not None:
-                    await self._config.on_device_alarm(device)
-                elif "stop" in getattr(device, "ACTIONS", {}):
-                    await device.execute_action("stop")
+                    # alarm callback 由使用者提供，型別 AsyncModbusDevice；呼叫前不做
+                    # isinstance 縮窄（測試廣用 MagicMock）。使用者應僅於會發 alarm 的
+                    # Modbus 設備註冊 callback。
+                    await self._config.on_device_alarm(device)  # type: ignore[arg-type]
+                elif "stop" in getattr(device, "ACTIONS", {}) and hasattr(device, "execute_action"):
+                    # execute_action 為 AsyncModbusDevice 專屬；DeviceProtocol 不含此方法
+                    await device.execute_action("stop")  # type: ignore[attr-defined]
                 logger.warning(f"Device alarm activated: {device_id}")
             elif not device.is_protected and device_id in self._alarmed_devices:
                 # 告警解除
                 self._alarmed_devices.discard(device_id)
                 if self._config.on_device_alarm_clear is not None:
-                    await self._config.on_device_alarm_clear(device)
+                    await self._config.on_device_alarm_clear(device)  # type: ignore[arg-type]
                 logger.info(f"Device alarm cleared: {device_id}")
 
     def _build_device_snapshots(self) -> list[DeviceSnapshot]:
@@ -924,6 +1284,11 @@ class SystemController(AsyncLifecycleMixin):
     def heartbeat(self) -> HeartbeatService | None:
         """心跳服務"""
         return self._heartbeat
+
+    @property
+    def command_refresh(self) -> CommandRefreshService | None:
+        """命令刷新（reconciler）服務；未啟用時回傳 ``None``"""
+        return self._command_refresh
 
     @property
     def event_overrides(self) -> list[EventDrivenOverride]:

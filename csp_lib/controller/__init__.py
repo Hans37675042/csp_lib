@@ -8,18 +8,21 @@
 from .calibration import FFCalibrationConfig, FFCalibrationStrategy
 from .compensator import PowerCompensator, PowerCompensatorConfig
 from .core import (
+    NO_CHANGE,
     Command,
     CommandProcessor,
     ConfigMixin,
     ExecutionConfig,
     ExecutionMode,
+    NoChange,
     Strategy,
     StrategyContext,
     SystemBase,
+    is_no_change,
 )
 from .discovery import ENTRY_POINT_GROUP, StrategyDescriptor, discover_strategies
 from .executor import ComputeOffloader, StrategyExecutor
-from .protocol import GridControllerBase, GridControllerProtocol
+from .protocol import GridControllerBase, GridControllerProtocol, StrategyAwareGridControllerProtocol
 from .services import PVDataService
 from .strategies import (
     BypassStrategy,
@@ -84,11 +87,15 @@ __all__ = [
     # Protocol
     "GridControllerBase",
     "GridControllerProtocol",
+    "StrategyAwareGridControllerProtocol",
     # Core
     "Command",
     "CommandProcessor",
     "SystemBase",
     "ConfigMixin",
+    "NoChange",
+    "NO_CHANGE",
+    "is_no_change",
     "StrategyContext",
     "ExecutionMode",
     "ExecutionConfig",

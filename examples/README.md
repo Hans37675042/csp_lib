@@ -44,6 +44,8 @@ uv run python examples/01_hello_device.py
 | 13 | `13_microgrid_simulation.py` | 完整微電網模擬 (PCS+BMS+Solar+Load+Meter) | 30 min |
 | 14 | `14_logging_system.py` | v0.7.0 日誌系統 (LogFilter/SinkManager/LogContext) | 15 min |
 | 15 | `15_runtime_parameters.py` | RuntimeParameters、CircuitBreaker | 15 min |
+| 16 | `16_operator_pattern.py` | v0.9.0 Operator Pattern：Reconciler Protocol / SetpointDrift / SiteManifest / TypeRegistry | 20 min |
+| 17 | `17_multi_unit_device.py` | v0.9.0 Multi-UnitID：per-point unit_id / PointGrouper 分桶 / used_unit_ids | 10 min |
 
 ## 架構概覽
 

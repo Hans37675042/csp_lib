@@ -3,8 +3,8 @@ tags:
   - type/moc
   - layer/integration
   - status/complete
-updated: 2026-04-04
-version: ">=0.4.2"
+updated: 2026-04-20
+version: ">=0.9.0"
 ---
 
 # Integration 模組總覽
@@ -33,9 +33,17 @@ Integration 模組負責將底層設備讀取值轉換為策略上下文、將�
 | 頁面 | 類型 | 說明 |
 |------|------|------|
 | [[ContextBuilder]] | class | 設備值 → StrategyContext 建構器 |
-| [[CommandRouter]] | class | Command → 設備寫入路由器 |
+| [[CommandRouter]] | class | Command → 設備寫入路由器（v0.8.1+ 含 desired state 追蹤） |
 | [[DeviceDataFeed]] | class | 設備事件 → PVDataService 資料餵入 |
 | [[PowerDistributor]] | class/protocol | 功率分配器（均分、比例、SOC 平衡） |
+
+### Reconciler 服務（v0.8.1+）
+
+| 頁面 | 類型 | 說明 |
+|------|------|------|
+| [[Command Refresh]] | guide/class | `CommandRefreshService`：reconciler，把 desired state 週期重傳到設備（v0.8.1） |
+| [[Operator Pattern]] | architecture | `Reconciler` Protocol + `TypeRegistry` + 三個 reconciler 實作對照（v0.9.0） |
+| [[Site Manifest]] | guide | YAML 驅動站點配置：`SiteManifest` / `load_manifest` / `from_manifest`（v0.9.0） |
 
 ### 控制迴圈
 
@@ -50,6 +58,7 @@ Integration 模組負責將底層設備讀取值轉換為策略上下文、將�
 | 頁面 | 類型 | 說明 |
 |------|------|------|
 | [[CapabilityBinding Integration]] | architecture | 能力驅動的設備整合架構與流程圖 |
+| [[Reconciliation Pattern]] | architecture | Kubernetes reconciler 設計模式與 CommandRefreshService 實作（v0.8.1）；v0.9.0 Protocol 已實作 |
 
 ## 資料流
 
@@ -61,8 +70,14 @@ Integration 模組負責將底層設備讀取值轉換為策略上下文、將�
                                Command
                                     ↓
                           CommandRouter → 設備寫入
-                        (CommandMapping 或
+                        (CommandMapping 或      ↓
                          CapabilityCommandMapping)
+                                    _last_written（desired state）
+                                         ↓ 週期 reconcile（v0.8.1）
+                          CommandRefreshService → 設備寫入
+
+背景服務（parallel）：
+  HeartbeatService (HeartbeatConfig.mappings + targets)
 ```
 
 ## 相關模組

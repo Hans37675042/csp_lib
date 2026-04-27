@@ -4,8 +4,9 @@ tags:
   - layer/integration
   - status/complete
 source: csp_lib/integration/system_controller.py
-updated: 2026-04-06
-version: ">=0.7.1"
+created: 2026-02-17
+updated: 2026-04-17
+version: ">=0.8.1"
 ---
 
 # SystemController
@@ -50,9 +51,19 @@ version: ">=0.7.1"
 | `runtime_params` | `RuntimeParameters \| None` | `None` | 系統參數，自動注入到 `StrategyContext.params` |
 | `capability_requirements` | `list[CapabilityRequirement]` | `[]` | 能力需求列表，供 `preflight_check()` 驗證 |
 | `strict_capability_check` | `bool` | `False` | 啟用嚴格能力檢查（preflight 失敗時 raise `ConfigurationError`） |
+| `trigger_on_read_device_ids` | `list[str]` | `[]` | v0.8.0+：啟動時自動對這些 device_id 的 `EVENT_READ_COMPLETE` 事件綁定 executor 觸發 |
+| `heartbeat` | `HeartbeatConfig \| None` | `None` | v0.8.1+：新版結構化心跳配置（取代下方 6 個 `heartbeat_*` 欄位） |
+| `command_refresh` | `CommandRefreshConfig \| None` | `None` | v0.8.1+：命令刷新（reconciler）服務配置；`enabled=True` 時自動啟動 [[Command Refresh\|CommandRefreshService]] |
 
-> [!info] v0.6.0 新增
-> `capability_requirements`、`strict_capability_check`、`post_protection_processors`、`runtime_params` 為 v0.6.0 新增欄位。
+> [!info] 版本說明
+> - v0.6.0 新增：`capability_requirements`、`strict_capability_check`、`post_protection_processors`、`runtime_params`
+> - v0.8.0 新增：`trigger_on_read_device_ids`（宣告式 read-complete trigger 配置）
+> - v0.8.1 新增：`heartbeat: HeartbeatConfig`、`command_refresh: CommandRefreshConfig`（結構化配置物件，取代舊有分散欄位）
+
+> [!warning] 舊版 heartbeat_* 欄位（Deprecated，v1.0.0 移除）
+> `heartbeat_mappings`、`heartbeat_interval`、`use_heartbeat_capability`、`heartbeat_capability_mode`、
+> `heartbeat_capability_constant_value`、`heartbeat_capability_increment_max` 六個欄位在 v0.8.1 後
+> 已由 `heartbeat: HeartbeatConfig` 取代，維持靜默相容（不 emit DeprecationWarning）至 v1.0.0。
 
 ### SystemControllerConfig.builder()
 
@@ -95,12 +106,14 @@ config = (
 | `processor(proc)` | 新增 post-protection 命令處理器 |
 | `params(runtime_params)` | 設定 RuntimeParameters |
 | `distributor(dist)` | 設定功率分配器 |
-| `heartbeat(mappings, interval, use_capability, mode)` | 設定心跳服務 |
+| `heartbeat(mappings_or_config, interval, use_capability, mode)` | 設定心跳服務；v0.8.1+ 支援傳入 `HeartbeatConfig` positional 參數 |
+| `command_refresh(interval_seconds, enabled, devices)` | v0.8.1+：啟用命令刷新 reconciler 服務 |
 | `alarm_mode_per_device(on_alarm, on_clear)` | 設定 per-device 告警模式 |
 | `data_feed(mapping, max_history=300)` | 設定 PV 資料餵入 |
 | `cascading(capacity_kva)` | 設定級聯策略最大視在功率 |
 | `require_capability(requirement)` | 新增能力需求（供 preflight 驗證） |
 | `strict_capability(enabled=True)` | 啟用嚴格能力檢查 |
+| `trigger_on_read_complete(device_id)` | v0.8.0+：宣告式 read-complete trigger（可多次呼叫多台設備） |
 | `build()` | 建構 `SystemControllerConfig` |
 
 ## API
@@ -117,6 +130,7 @@ config = (
 | `pop_override(name)` | 移除 override 模式 |
 | `register_event_override(override)` | 註冊事件驅動 override（見[[EventDrivenOverride]]） |
 | `trigger()` | 手動觸發策略執行 |
+| `attach_read_trigger(device_id)` | v0.8.0+：將指定設備的 `EVENT_READ_COMPLETE` 綁定為 executor 觸發，回傳 detacher callable |
 
 ### Preflight Check（v0.6.0 新增）
 
@@ -135,6 +149,48 @@ failures = controller.preflight_check()
 if failures:
     print("能力檢查未通過：", failures)
 ```
+
+### Event-Driven Trigger（v0.8.0 新增）
+
+`attach_read_trigger(device_id)` 將指定設備的 `EVENT_READ_COMPLETE` 事件綁定為 `StrategyExecutor.trigger()` 的呼叫源，達成「設備讀完即執行策略」的低延遲流程，避免時間錨式 PERIODIC 與 ReadScheduler 之間的 phase drift。
+
+```python
+def attach_read_trigger(self, device_id: str) -> Callable[[], None]
+```
+
+**行為**：
+- 每次 `device_id` 的 `EVENT_READ_COMPLETE` 觸發，自動呼叫 `executor.trigger()`
+- 重複 attach 同 device_id 拋 `ValueError`（fail-fast 冪等保護）
+- `device_id` 未在 registry 拋 `ValueError`
+- 回傳 wrapped detacher callable，呼叫即解除綁定
+
+**宣告式方式（建議）**：透過 Builder 或 Config 設定，`_on_start` 自動 attach，`_on_stop` 自動 detach：
+
+```python
+config = (
+    SystemControllerConfig.builder()
+    .trigger_on_read_complete("meter_01")   # 讀完即觸發策略
+    .trigger_on_read_complete("pcs_01")     # 可多台
+    .build()
+)
+
+# 或等效直接設定 config 欄位
+config = SystemControllerConfig(
+    trigger_on_read_device_ids=["meter_01", "pcs_01"],
+    ...
+)
+```
+
+**命令式方式（執行期動態）**：
+
+```python
+detacher = controller.attach_read_trigger("meter_01")
+# ... 使用一段時間後解除
+detacher()
+```
+
+> [!note] 搭配使用
+> 與 `ExecutionMode.TRIGGERED` 或 `HYBRID` 策略搭配使用。PERIODIC 模式搭配後策略雖仍按週期執行，但也可被提前觸發。
 
 ### 排程模式控制（v0.4.2 新增）
 
@@ -197,11 +253,14 @@ Command (raw) -> ProtectionGuard.apply() -> Command (protected)
        |
 _evaluate_event_overrides(context) -> push/pop override (ModeManager)
        |
-CommandRouter.route() -> Device writes
+CommandRouter.route() -> Device writes  ← _last_written 追蹤 (v0.8.1)
   (CommandMapping + CapabilityCommandMapping)
 
 HeartbeatService (parallel)
-  (HeartbeatMapping + use_heartbeat_capability)
+  (HeartbeatConfig.mappings + HeartbeatConfig.targets)  ← v0.8.1
+
+CommandRefreshService (parallel, v0.8.1)
+  每 interval 秒把 CommandRouter._last_written 重傳到設備
 ```
 
 ## 事件驅動 Override
@@ -319,6 +378,66 @@ async with controller:
     await asyncio.sleep(3600)
 ```
 
+## v0.8.1 新增：HeartbeatConfig 與 CommandRefreshConfig
+
+### HeartbeatConfig（新版心跳配置）
+
+```python
+from csp_lib.integration import HeartbeatConfig, HeartbeatTarget, DeviceHeartbeatTarget
+from csp_lib.integration.heartbeat_generators import ToggleGenerator, IncrementGenerator
+
+# 新版 API（v0.8.1）
+config = (
+    SystemControllerConfig.builder()
+    .heartbeat(HeartbeatConfig(
+        mappings=[
+            HeartbeatMapping(
+                device_id="pcs1",
+                point_name="heartbeat_reg",
+                value_generator=ToggleGenerator(),   # 取代 mode=HeartbeatMode.TOGGLE
+            ),
+        ],
+        targets=[
+            DeviceHeartbeatTarget(pcs2_device, "heartbeat_counter"),
+            GatewayRegisterHeartbeatTarget(gateway, "ctrl_alive"),
+        ],
+        interval_seconds=1.0,
+    ))
+    .build()
+)
+```
+
+### CommandRefreshConfig（v0.8.1 新增）
+
+```python
+from csp_lib.integration import CommandRefreshConfig
+
+# Builder 方式（建議）
+config = (
+    SystemControllerConfig.builder()
+    .command_refresh(
+        interval_seconds=1.0,   # < PCS watchdog / 2
+        enabled=True,
+        devices=["pcs1", "pcs2"],   # None = 所有被追蹤設備
+    )
+    .build()
+)
+
+# 等效直接設定
+config = SystemControllerConfig(
+    command_refresh=CommandRefreshConfig(
+        refresh_interval=1.0,
+        enabled=True,
+        device_filter=frozenset({"pcs1", "pcs2"}),
+    ),
+    # ...
+)
+```
+
+> [!note] v0.8.1 生命週期啟動順序
+> 啟動：command_refresh → heartbeat → executor（command_refresh 先於 heartbeat，避免首輪 reconcile 被 pause/resume 干擾；executor 最後掛 task）
+> 停止：executor → heartbeat → command_refresh（先停新命令來源，再依序停輸出端）
+
 ## 相關頁面
 
 - [[GridControlLoop]] — 基礎版控制迴圈
@@ -333,3 +452,5 @@ async with controller:
 - [[CapabilityCommandMapping]] — Capability-driven command 映射
 - [[CapabilityRequirement]] — 能力需求定義（preflight validation）
 - [[CapabilityBinding Integration]] — 能力驅動整合的完整架構與流程圖
+- [[Command Refresh]] — CommandRefreshService 使用指南（v0.8.1）
+- [[Reconciliation Pattern]] — reconciler 架構設計說明

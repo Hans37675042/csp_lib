@@ -3,8 +3,8 @@ tags:
   - type/moc
   - status/complete
 created: 2026-02-17
-updated: 2026-04-06
-version: ">=0.7.1"
+updated: 2026-04-22
+version: ">=0.9.0"
 ---
 
 # Guides
@@ -26,6 +26,9 @@ version: ">=0.7.1"
 | [[ModbusGateway Setup]] | ModbusGateway 設定：暴露系統狀態給 EMS/SCADA，WriteHook、DataSyncSource |
 | [[Capability-driven Deployment]] | Capability 系統：設備能力宣告、CapabilityBinding、preflight_check 驗證 |
 | [[Custom Database Backend]] | 自訂資料庫後端：BatchUploader Protocol、InfluxDB / PostgreSQL 實作範例 |
+| [[Command Refresh]] | 命令刷新（Reconciler）：解決寫入失敗黑洞、PCS watchdog 歸零、Gateway 繞過覆蓋（v0.8.1） |
+| [[Site Manifest]] | YAML 宣告式站點配置：SiteManifest / TypeRegistry / from_manifest（v0.9.0） |
+| [[Multi-UnitID Device]] | 單一 AsyncModbusDevice 對應多 Modbus slave：per-point unit_id、used_unit_ids（v0.9.0） |
 
 ## 相關資源
 

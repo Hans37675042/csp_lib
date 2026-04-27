@@ -1,7 +1,7 @@
 ---
 tags: [type/moc, status/complete]
-updated: 2026-04-04
-version: 0.6.1
+updated: 2026-04-20
+version: ">=0.9.0"
 ---
 # _MOC Architecture
 
@@ -18,6 +18,8 @@ csp_lib 採用嚴格的分層架構，依賴方向由上往下，每層只依賴
 - [[System Diagrams]] — v0.6 系統總覽、流程、狀態機與生命週期圖表（6 張）
 - [[Data Flow]] — 核心資料流（讀取循環、控制循環、模式切換）
 - [[Design Patterns]] — 設計模式總覽
+- [[Reconciliation Pattern]] — Kubernetes reconciler 模式與 CommandRefreshService 實作（v0.8.1）；v0.9.0 Protocol 已實作
+- [[Operator Pattern]] — Reconciler Protocol + TypeRegistry + Site Manifest 完整 Operator 架構（v0.9.0）
 
 ### 技術模式
 - [[Async Patterns]] — 非同步優先模式與生命週期管理
@@ -44,3 +46,4 @@ SORT file.name ASC
 | [[_MOC Integration]] | 整合層 |
 | [[_MOC Manager]] | 管理層 |
 | [[_MOC Storage]] | 儲存層（MongoDB + Redis） |
+| [[_MOC Alarm]] | Alarm 模組（L8，告警聚合與 Redis 橋接，v0.8.2） |

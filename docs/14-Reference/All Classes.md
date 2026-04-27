@@ -3,8 +3,8 @@ tags:
   - type/reference
   - status/complete
 created: 2026-02-17
-updated: 2026-04-05
-version: ">=0.7.0"
+updated: 2026-04-20
+version: ">=0.9.0"
 
 ---
 
@@ -109,6 +109,12 @@ SORT file.name ASC
 | [[GridLimitProtection]] | 電網限制保護規則（v0.5.0） |
 | [[RampStopProtection]] | 斜率停機保護規則（v0.5.0） |
 
+**快速參考（v0.8.0 新增）：**
+
+| 名稱 | 說明 |
+|------|------|
+| [[Command\|NoChange]] | `Command.p_target` / `q_target` 的「此軸不變更」sentinel 類別（v0.8.0） |
+
 ### Manager
 
 ```dataview
@@ -140,6 +146,69 @@ SORT file.name ASC
 | [[AggregationResult]] | 聚合結果資料結構（v0.5.0） |
 | [[CapabilityRequirement]] | 能力需求定義（v0.5.0） |
 
+**快速參考（v0.8.1 新增）：**
+
+| 類別 | 說明 |
+|------|------|
+| [[Command Refresh\|CommandRefreshService]] | Reconciler：把 desired state 週期重傳到設備（v0.8.1） |
+| [[SystemController\|CommandRefreshConfig]] | `CommandRefreshService` 的 frozen dataclass 配置（v0.8.1） |
+| [[SystemController\|HeartbeatConfig]] | 心跳服務結構化配置（收攏舊版 6 欄位，v0.8.1） |
+| [[Command Refresh\|HeartbeatValueGenerator]] | 心跳值產生器 `@runtime_checkable` Protocol（v0.8.1） |
+| [[Command Refresh\|ToggleGenerator]] | 0/1 交替的心跳值產生器（v0.8.1） |
+| [[Command Refresh\|IncrementGenerator]] | 遞增計數心跳值產生器，到 `max_value` 後歸零（v0.8.1） |
+| [[Command Refresh\|ConstantGenerator]] | 常數值心跳值產生器（v0.8.1） |
+| [[Command Refresh\|HeartbeatTarget]] | 心跳寫入目標 `@runtime_checkable` Protocol（v0.8.1） |
+| [[Command Refresh\|DeviceHeartbeatTarget]] | `AsyncModbusDevice` 點位的心跳寫入目標（v0.8.1） |
+| [[Command Refresh\|GatewayRegisterHeartbeatTarget]] | Modbus Gateway register 的心跳寫入目標（v0.8.1） |
+
+**快速參考（v0.8.2 新增）：**
+
+| 名稱 | 說明 |
+|------|------|
+| [[DeviceRegistry\|StatusChangeCallback]] | `Callable[[str, bool], None]`：設備回應狀態變化回呼簽名（v0.8.2） |
+| [[PowerDistributor\|SOCSource]] | `Callable[[DeviceSnapshot], float \| None]`：自訂 SOC 取值函式簽名（v0.8.2） |
+
+**快速參考（v0.9.0 新增）：**
+
+| 名稱 | 說明 |
+|------|------|
+| [[Operator Pattern\|Reconciler]] | `@runtime_checkable` Reconciler Protocol — name / status / reconcile_once（v0.9.0） |
+| [[Operator Pattern\|ReconcilerStatus]] | reconcile 執行狀態 frozen dataclass，含 `.empty(name)` classmethod（v0.9.0） |
+| [[Operator Pattern\|SetpointDriftReconciler]] | 偵測 desired vs actual setpoint drift 並修正寫入的 Reconciler（v0.9.0） |
+| [[Operator Pattern\|DriftTolerance]] | setpoint drift 容忍範圍配置 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|TypeRegistry]] | Generic[T] kind → class 映射表，Thread-safe（v0.9.0） |
+| [[Site Manifest\|device_type_registry]] | 全域設備型別 TypeRegistry singleton（v0.9.0） |
+| [[Site Manifest\|strategy_type_registry]] | 全域策略型別 TypeRegistry singleton（v0.9.0） |
+| [[Site Manifest\|SiteManifest]] | 站點宣告式配置頂層 frozen dataclass（apiVersion: csp_lib/v1，v0.9.0） |
+| [[Site Manifest\|ManifestMetadata]] | manifest metadata 段落 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|SiteSpec]] | manifest spec 段落 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|DeviceSpec]] | 單一設備規格 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|StrategySpec]] | 單一策略規格 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|ReconcilerSpec]] | 單一 reconciler 規格 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|BoundDeviceSpec]] | 繫結到 class 後的設備規格 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|BoundStrategySpec]] | 繫結到 class 後的策略規格 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|BoundReconcilerSpec]] | 繫結到 class 後的 reconciler 規格 frozen dataclass（v0.9.0） |
+| [[Site Manifest\|ManifestBindResult]] | `apply_manifest_to_builder` 回傳結果 frozen dataclass（v0.9.0） |
+
+### Alarm（v0.8.2）
+
+```dataview
+TABLE source AS "來源模組"
+FROM ""
+WHERE contains(tags, "type/class") AND contains(tags, "layer/alarm")
+SORT file.name ASC
+```
+
+**快速參考：**
+
+| 名稱 | 說明 |
+|------|------|
+| [[AlarmAggregator]] | 多 source OR 聚合器（v0.8.2） |
+| [[AlarmAggregator\|WatchdogProtocol]] | Watchdog 結構化協定 `@runtime_checkable`（v0.8.2） |
+| [[AlarmAggregator\|AlarmChangeCallback]] | `Callable[[bool], None]` callback 型別別名（v0.8.2） |
+| [[Redis Adapter\|RedisAlarmPublisher]] | AlarmAggregator → Redis pub（v0.8.2，需 `[redis]`） |
+| [[Redis Adapter\|RedisAlarmSource]] | Redis sub → AlarmAggregator（v0.8.2，需 `[redis]`） |
+
 ### Storage (Mongo / Redis)
 
 ```dataview
@@ -148,6 +217,17 @@ FROM ""
 WHERE contains(tags, "type/class") AND (contains(tags, "layer/mongo") OR contains(tags, "layer/redis"))
 SORT file.name ASC
 ```
+
+**快速參考（v0.8.2 新增）：**
+
+| 類別 | 說明 |
+|------|------|
+| [[LocalBufferedUploader]] | 本地緩衝上傳器；backend-agnostic，透過 `LocalBufferStore` Protocol 插拔（v0.8.2） |
+| [[LocalBufferedUploader\|LocalBufferConfig]] | `LocalBufferedUploader` 的 replay/cleanup frozen dataclass 配置（v0.8.2）；不含 `db_path` |
+| [[LocalBufferStore]] | Backend-agnostic 儲存 Protocol（`@runtime_checkable`，10 個 async CRUD method，v0.8.2） |
+| [[LocalBufferStore\|BufferedRow]] | `fetch_pending` 回傳的唯讀資料快照 frozen dataclass（v0.8.2） |
+| [[SqliteBufferStore]] | `LocalBufferStore` 的 aiosqlite + WAL 實作（v0.8.2，需 `csp_lib[local-buffer]`） |
+| [[MongoBufferStore]] | `LocalBufferStore` 的本地 mongod 實作（v0.8.2，已含於 `csp_lib[mongo]`，適用雙 MongoDB 拓樸） |
 
 ### Cluster
 
@@ -180,6 +260,11 @@ SORT file.name ASC
 | [[StatePersistHook]] | 狀態持久化鉤子 |
 | [[RedisSubscriptionSource]] | Redis 訂閱資料來源 |
 | [[PollingCallbackSource]] | 輪詢回呼資料來源 |
+| [[RegistryAggregatingSource]] | DeviceRegistry 聚合同步來源（v0.8.2） |
+| [[RegistryAggregatingSource\|RegisterAggregateMapping]] | 單一 register 聚合映射定義 frozen dataclass（v0.8.2） |
+| [[RegistryAggregatingSource\|AggregateFunc]] | 內建聚合函式列舉 AVERAGE/SUM/MIN/MAX（v0.8.2） |
+| [[RegistryAggregatingSource\|AggregateCallable]] | 自訂聚合函式型別別名 `Callable[[list[float]], float]`（v0.8.2） |
+| [[GatewayConfig\|RegisterNotWritableError]] | EMS 寫入 writable=False register 時拋出（v0.7.3） |
 
 ### Modbus Server（v0.5.2）
 

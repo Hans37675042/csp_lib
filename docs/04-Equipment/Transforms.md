@@ -4,8 +4,8 @@ tags:
   - layer/equipment
   - status/complete
 source: csp_lib/equipment/core/transform.py
-updated: 2026-04-04
-version: ">=0.4.2"
+updated: 2026-04-16
+version: ">=0.7.3"
 ---
 
 # Transforms
@@ -29,7 +29,7 @@ version: ">=0.4.2"
 | `ByteExtractTransform` | `byte_offset: int = 0`, `byte_length: int = 1` | 位元組提取 | 從暫存器列表提取指定位元組 |
 | `MultiFieldExtractTransform` | `fields: tuple[tuple[str, int, int], ...]` | 多位元欄位提取 | 從單一整數提取多個命名欄位 |
 | `InverseTransform` | `magnitude: float = 1.0`, `offset: float = 0.0` | 反向縮放（寫入用）: `(value - offset) / magnitude` | ScaleTransform 的逆運算 |
-| `PowerFactorTransform` | `include_status: bool = False` | 功率因數解碼（Schneider PM5350 專用） | 特殊四象限編碼 |
+| `PowerFactorTransform` | `include_status: bool = False` | 功率因數解碼（部分電錶採用此編碼） | 特殊四象限編碼 |
 
 ---
 
@@ -58,7 +58,10 @@ temp.apply(250)  # -> -15.0
 
 ### BitExtractTransform
 
-從整數值中提取指定範圍的位元，不限制位元大小（支援 16/32/64 bit 或更大）。
+從整數值中提取指定範圍的位元，上限為 64 bit（`bit_offset + bit_length <= 64`）。
+
+> [!note] v0.7.3 BUG-009
+> `__post_init__` 新增 `bit_offset + bit_length <= 64` 上限驗證。超出範圍時拋出 `ValueError`，不再靜默回傳 0。
 
 ```python
 # 提取 Bit 0 作為布林值
@@ -66,6 +69,9 @@ BitExtractTransform(bit_offset=0).apply(0xFF01)  # -> True
 
 # 提取 Bit 8-11 作為 4-bit 數值
 BitExtractTransform(bit_offset=8, bit_length=4).apply(0x0F00)  # -> 15
+
+# 超出範圍 — 在 v0.7.3+ 拋出 ValueError
+BitExtractTransform(bit_offset=60, bit_length=8)  # ValueError: bit_offset + bit_length > 64
 ```
 
 ### MultiFieldExtractTransform
@@ -84,7 +90,7 @@ transform.apply(0x0301)
 
 ### PowerFactorTransform
 
-Schneider PM5350 專用功率因數解碼，支援四象限編碼：
+部分電錶採用的功率因數解碼，支援四象限編碼：
 
 - Q1 (0 ~ 90 度): `0 < x < 1` -> PF = x, lagging
 - Q2 (90 ~ 180 度): `-2 < x < -1` -> PF = -2 - x, leading

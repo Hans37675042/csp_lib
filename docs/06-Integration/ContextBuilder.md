@@ -4,8 +4,9 @@ tags:
   - layer/integration
   - status/complete
 source: csp_lib/integration/context_builder.py
-updated: 2026-04-04
-version: ">=0.4.2"
+created: 2026-02-17
+updated: 2026-04-17
+version: ">=0.8.0"
 ---
 
 # ContextBuilder
@@ -45,6 +46,7 @@ version: ">=0.4.2"
 2. 遍歷每個 [[ContextMapping]]：
    - **device_id 模式**：直接讀取單一設備的 `latest_values`
    - **trait 模式**：收集所有 responsive 設備的值，透過 [[AggregateFunc]] 聚合
+   - **param_key 模式**（v0.8.0+）：從 `runtime_params.get(param_key)` 讀值；若 `runtime_params` 未提供則 log warning 並回退至 `default`
 3. 遍歷每個 [[CapabilityContextMapping]]：
    - **device_id 模式**：`resolve_point()` → `latest_values`
    - **trait 模式**：過濾 responsive + `has_capability` → 聚合
@@ -77,6 +79,9 @@ builder = ContextBuilder(
 context = builder.build()
 # context.soc, context.extra["avg_soc"], context.params 皆已填入
 ```
+
+> [!note] v0.7.2 NaN/Inf fail-safe（SEC-013a）
+> `_set_context_field()` 寫入欄位前先以 `math.isfinite()` 檢查浮點值：非有限 float（NaN/Inf）寫入 `None` 而非保留 stale value。context 欄位型別本就是 `float | None`，下游沿用既有 None 處理路徑。此設計讓 Modbus `Float32/64.decode()` 可維持 IEEE 754 permissive（保留合法 NaN/Inf sentinel，如電表 fault 信號），由 L6 進行 fail-safe 過濾。
 
 ## 相關頁面
 

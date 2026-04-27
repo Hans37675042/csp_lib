@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 
 class TransformStep(Protocol):
@@ -187,11 +187,20 @@ class BitExtractTransform:
     bit_offset: int
     bit_length: int = 1
 
+    # 最大可操作位元上限：對應 4 個 16-bit register 的組合
+    _MAX_BIT_WIDTH: ClassVar[int] = 64
+
     def __post_init__(self) -> None:
         if self.bit_offset < 0:
             raise ValueError(f"bit_offset 必須 >= 0，收到: {self.bit_offset}")
         if self.bit_length < 1:
             raise ValueError(f"bit_length 必須 >= 1，收到: {self.bit_length}")
+        total = self.bit_offset + self.bit_length
+        if total > self._MAX_BIT_WIDTH:
+            raise ValueError(
+                f"bit_offset({self.bit_offset}) + bit_length({self.bit_length}) = {total} "
+                f"超過可操作範圍上限 {self._MAX_BIT_WIDTH}"
+            )
 
     @property
     def mask(self) -> int:
@@ -245,9 +254,9 @@ class ByteExtractTransform:
 @dataclass(frozen=True, slots=True)
 class PowerFactorTransform:
     """
-    功率因數解碼轉換（Schneider PM5350 專用）
+    功率因數解碼轉換（部分電錶採用此四象限編碼）
 
-    PM5350 使用特殊編碼表示功率因數與相位：
+    部分電錶使用特殊編碼表示功率因數與相位：
         - Q1 (0° ~ 90°):   0 < x < 1   → PF = x, lagging
         - Q2 (90° ~ 180°): -2 < x < -1 → PF = -2 - x, leading
         - Q3 (180° ~ 270°): -1 < x < 0 → PF = x, lagging

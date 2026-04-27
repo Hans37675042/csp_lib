@@ -12,17 +12,25 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from csp_lib.core import get_logger
 
 from .schema import CapabilityRequirement, capability_display_name
 
 if TYPE_CHECKING:
-    from csp_lib.equipment.device import AsyncModbusDevice
+    from csp_lib.equipment.device import DeviceProtocol
     from csp_lib.equipment.device.capability import Capability
 
 logger = get_logger(__name__)
+
+# Status-change callback 簽名: (device_id, responsive) -> None
+# responsive=True 代表設備從無回應轉為有回應；False 則為反向。
+StatusChangeCallback = Callable[[str, bool], None]
+
+# Unregister callback 簽名: (device_id) -> None
+# 設備自 Registry 解除註冊後呼叫（鎖外執行），供下游元件清理 per-device 狀態。
+UnregisterCallback = Callable[[str], None]
 
 
 class DeviceRegistry:
@@ -30,7 +38,7 @@ class DeviceRegistry:
     Trait-based 設備查詢索引
 
     維護雙向索引：
-      - device_id → AsyncModbusDevice
+      - device_id → DeviceProtocol
       - device_id → set[trait]
       - trait → set[device_id]
 
@@ -40,16 +48,21 @@ class DeviceRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._devices: dict[str, AsyncModbusDevice] = {}  # device_id → 設備實例
+        self._devices: dict[str, DeviceProtocol] = {}  # device_id → 設備實例
         self._device_traits: dict[str, set[str]] = {}  # device_id → 該設備的 traits
         self._trait_devices: dict[str, set[str]] = {}  # trait → 擁有該 trait 的 device_ids
         self._metadata: dict[str, dict[str, Any]] = {}  # device_id → 靜態 metadata
+        # Status-change 觀察者與最近一次觀測狀態（用於變更偵測）
+        self._status_observers: list[StatusChangeCallback] = []
+        self._last_responsive: dict[str, bool] = {}  # device_id → 上次 notify 時的 responsive
+        # Unregister 觀察者：設備自 Registry 移除時通知下游清理 per-device 狀態
+        self._unregister_observers: list[UnregisterCallback] = []
 
     # ---- 註冊 / 移除 ----
 
     def register(
         self,
-        device: AsyncModbusDevice,
+        device: DeviceProtocol,
         traits: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -57,7 +70,7 @@ class DeviceRegistry:
         註冊設備與可選的 traits 和 metadata
 
         Args:
-            device: 要註冊的 Modbus 設備
+            device: 要註冊的設備（任何滿足 DeviceProtocol 的實作，如 AsyncModbusDevice）
             traits: 設備的 trait 標籤列表（可選）
             metadata: 設備靜態資訊（可選），如 rated_p、rated_s 等
 
@@ -76,7 +89,7 @@ class DeviceRegistry:
 
     def register_with_capabilities(
         self,
-        device: AsyncModbusDevice,
+        device: DeviceProtocol,
         extra_traits: Sequence[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -87,7 +100,7 @@ class DeviceRegistry:
         then merges with extra_traits provided by user.
 
         Args:
-            device: 要註冊的 Modbus 設備
+            device: 要註冊的設備（任何滿足 DeviceProtocol 的實作，如 AsyncModbusDevice）
             extra_traits: 額外的 trait 標籤（可選），會排在自動發現的 traits 前面
             metadata: 設備靜態資訊（可選）
 
@@ -102,9 +115,14 @@ class DeviceRegistry:
         """
         移除設備及其所有 trait 關聯
 
+        成功移除後（device 先前存在），會鎖外同步呼叫所有
+        unregister observer，供下游元件（如 ``CommandRouter``）清理
+        per-device 狀態。device_id 不存在時靜默忽略且**不觸發** observer。
+
         Args:
             device_id: 要移除的設備 ID（不存在時靜默忽略）
         """
+        removed = False
         with self._lock:
             if device_id not in self._devices:
                 return
@@ -113,6 +131,13 @@ class DeviceRegistry:
             del self._devices[device_id]
             del self._device_traits[device_id]
             self._metadata.pop(device_id, None)
+            # 移除設備時同步清除狀態基準，避免下次以同名 id 重註冊後
+            # 首次 notify 誤判為「狀態變化」
+            self._last_responsive.pop(device_id, None)
+            removed = True
+        # 鎖外通知 observers
+        if removed:
+            self._notify_unregistered(device_id)
 
     # ---- Trait 管理 ----
 
@@ -150,22 +175,22 @@ class DeviceRegistry:
 
     # ---- 查詢 ----
 
-    def get_device(self, device_id: str) -> AsyncModbusDevice | None:
+    def get_device(self, device_id: str) -> DeviceProtocol | None:
         """依 ID 查詢設備，不存在回傳 None"""
         with self._lock:
             return self._devices.get(device_id)
 
-    def get_devices_by_trait(self, trait: str) -> list[AsyncModbusDevice]:
+    def get_devices_by_trait(self, trait: str) -> list[DeviceProtocol]:
         """依 trait 查詢所有設備（按 device_id 排序，確保確定性）"""
         with self._lock:
             ids = self._trait_devices.get(trait, set())
             return [self._devices[did] for did in sorted(ids)]
 
-    def get_responsive_devices_by_trait(self, trait: str) -> list[AsyncModbusDevice]:
+    def get_responsive_devices_by_trait(self, trait: str) -> list[DeviceProtocol]:
         """依 trait 查詢所有 is_responsive=True 的設備（按 device_id 排序）"""
         return [d for d in self.get_devices_by_trait(trait) if d.is_responsive]
 
-    def get_first_responsive_device_by_trait(self, trait: str) -> AsyncModbusDevice | None:
+    def get_first_responsive_device_by_trait(self, trait: str) -> DeviceProtocol | None:
         """依 trait 取得第一台 responsive 設備，無則回傳 None"""
         devices = self.get_responsive_devices_by_trait(trait)
         return devices[0] if devices else None
@@ -181,7 +206,7 @@ class DeviceRegistry:
             return dict(self._metadata.get(device_id, {}))
 
     @property
-    def all_devices(self) -> list[AsyncModbusDevice]:
+    def all_devices(self) -> list[DeviceProtocol]:
         """所有已註冊設備（按 device_id 排序）"""
         with self._lock:
             return [self._devices[did] for did in sorted(self._devices)]
@@ -194,7 +219,7 @@ class DeviceRegistry:
 
     # ---- Capability 查詢 ----
 
-    def get_devices_with_capability(self, capability: Capability | str) -> list[AsyncModbusDevice]:
+    def get_devices_with_capability(self, capability: Capability | str) -> list[DeviceProtocol]:
         """取得具備指定能力的所有設備（按 device_id 排序）"""
         with self._lock:
             return sorted(
@@ -202,7 +227,7 @@ class DeviceRegistry:
                 key=lambda d: d.device_id,
             )
 
-    def get_responsive_devices_with_capability(self, capability: Capability | str) -> list[AsyncModbusDevice]:
+    def get_responsive_devices_with_capability(self, capability: Capability | str) -> list[DeviceProtocol]:
         """取得具備指定能力且 responsive 的設備（按 device_id 排序）"""
         return [d for d in self.get_devices_with_capability(capability) if d.is_responsive]
 
@@ -321,6 +346,141 @@ class DeviceRegistry:
     def __contains__(self, device_id: str) -> bool:
         with self._lock:
             return device_id in self._devices
+
+    # ---- 狀態變化通知 ----
+
+    def on_status_change(self, callback: StatusChangeCallback) -> None:
+        """
+        註冊「設備回應狀態變化」觀察者。
+
+        回呼簽名: ``callback(device_id: str, responsive: bool) -> None``，
+        其中 ``responsive`` 為變化後的新狀態。僅當實際變化（baseline 已建立
+        且新舊狀態不同）時才會觸發；首次 ``notify_status`` 僅建立 baseline。
+
+        Thread-safe：append 在 ``self._lock`` 保護下進行，避免與
+        ``_notify_status_change`` 的 snapshot 或其他執行緒的註冊 race。
+
+        Args:
+            callback: 狀態變化回呼。例外會被捕獲並記錄，不會影響其他觀察者。
+        """
+        with self._lock:
+            self._status_observers.append(callback)
+
+    def remove_status_observer(self, callback: StatusChangeCallback) -> None:
+        """
+        移除已註冊的狀態變化觀察者。
+
+        Thread-safe：remove 在 ``self._lock`` 保護下進行。
+
+        Args:
+            callback: 欲移除的回呼。未註冊時靜默忽略。
+        """
+        with self._lock:
+            try:
+                self._status_observers.remove(callback)
+            except ValueError:
+                pass
+
+    def notify_status(self, device_id: str) -> None:
+        """
+        由呼叫方（DeviceManager / 輪詢迴圈）在讀取設備 ``is_responsive``
+        後呼叫，Registry 會判斷是否為狀態變化並通知觀察者。
+
+        行為：
+            * 首次呼叫：僅建立 baseline，不觸發 observers（避免啟動期噪訊）。
+            * 後續呼叫：若 ``is_responsive`` 與上次相比發生變化，鎖外
+              同步呼叫所有觀察者。
+            * 未註冊的 ``device_id`` 靜默忽略。
+
+        Deadlock 預防：
+            在鎖內讀取 device 與 ``_last_responsive``、判定 changed、更新
+            baseline；離開鎖後才呼叫 observers。若 observer 反向存取
+            Registry，不會發生重入死鎖。
+
+        Args:
+            device_id: 設備 ID。
+        """
+        changed_to: bool | None = None
+        with self._lock:
+            device = self._devices.get(device_id)
+            if device is None:
+                return
+            current = bool(device.is_responsive)
+            prev = self._last_responsive.get(device_id)
+            # 更新 baseline；前後差異才觸發
+            self._last_responsive[device_id] = current
+            if prev is not None and prev != current:
+                changed_to = current
+        # 鎖外呼叫 observers
+        if changed_to is not None:
+            self._notify_status_change(device_id, changed_to)
+
+    def _notify_status_change(self, device_id: str, responsive: bool) -> None:
+        """
+        同步呼叫所有 status observers（鎖外執行）。
+
+        在 ``self._lock`` 內以 ``list(...)`` 取得 observer 的 snapshot，
+        鎖外再逐一呼叫。此作法保證：
+
+        * 與 ``on_status_change`` / ``remove_status_observer`` 的並發
+          append/remove 不會造成 ``list changed size during iteration`` 或
+          漏叫 callback。
+        * callback 在鎖外執行，若 observer 反向存取 Registry 不會重入死鎖。
+        * 單一 observer 例外不影響其他 observer，統一以
+          ``logger.opt(exception=True).warning(...)`` 記錄。
+
+        Args:
+            device_id: 狀態變化的設備 ID。
+            responsive: 變化後的 responsive 狀態。
+        """
+        with self._lock:
+            observers = list(self._status_observers)
+        for cb in observers:
+            try:
+                cb(device_id, responsive)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    f"DeviceRegistry status observer 執行失敗: device_id={device_id}, responsive={responsive}"
+                )
+
+    # ---- Unregister 觀察者 ----
+
+    def on_unregister(self, callback: UnregisterCallback) -> None:
+        """註冊「設備解除註冊」觀察者。
+
+        回呼簽名 ``callback(device_id: str) -> None``，在設備自 Registry 成功
+        移除後、鎖外同步呼叫。用於讓下游元件（如 ``CommandRouter``）清理
+        與該 device_id 綁定的 per-device 狀態。
+
+        Thread-safe：append 在 ``self._lock`` 保護下進行。例外不影響其他
+        observer，統一以 ``logger.opt(exception=True).warning(...)`` 記錄。
+        """
+        with self._lock:
+            self._unregister_observers.append(callback)
+
+    def remove_unregister_observer(self, callback: UnregisterCallback) -> None:
+        """移除已註冊的 unregister 觀察者；未註冊時靜默忽略。"""
+        with self._lock:
+            try:
+                self._unregister_observers.remove(callback)
+            except ValueError:
+                pass
+
+    def _notify_unregistered(self, device_id: str) -> None:
+        """鎖外同步呼叫所有 unregister observers。
+
+        在 ``self._lock`` 內以 ``list(...)`` 取得 observer 的 snapshot，
+        鎖外再逐一呼叫，避免 callback 反向存取 Registry 時重入死鎖。
+        """
+        with self._lock:
+            observers = list(self._unregister_observers)
+        for cb in observers:
+            try:
+                cb(device_id)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    f"DeviceRegistry unregister observer 執行失敗: device_id={device_id}"
+                )
 
     # ---- 內部輔助 ----
 

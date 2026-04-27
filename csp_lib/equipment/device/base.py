@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from csp_lib.core import get_logger
+from csp_lib.core._numeric import is_non_finite_float
+from csp_lib.core._time_anchor import next_tick_delay
 from csp_lib.core.errors import CommunicationError, ConfigurationError, DeviceConnectionError
 from csp_lib.core.health import HealthReport, HealthStatus
 from csp_lib.equipment.alarm import AlarmEvaluator, AlarmStateManager
@@ -124,6 +126,10 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
         self._read_points_always: tuple[ReadPoint, ...] = tuple(always_points)
         self._read_points_rotating: tuple[tuple[ReadPoint, ...], ...] = tuple(tuple(pts) for pts in rotating_points)
 
+        # ReadPoint lookup（供 reject_non_finite 等 per-point 策略查詢）
+        self._read_point_lookup: dict[str, ReadPoint] = self._build_read_point_lookup()
+        self._has_any_reject_non_finite: bool = any(p.reject_non_finite for p in self._read_point_lookup.values())
+
         # 建立排程器（自動分組）
         self._grouper = PointGrouper()
         self._scheduler = ReadScheduler(
@@ -145,6 +151,9 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
 
         # 寫入點位查詢表
         self._write_points = {write_point.name: write_point for write_point in write_points}
+
+        # 計算此設備實際觸及的 unit_id 集合（sentinel resolve：None → config.unit_id）
+        self._used_unit_ids: frozenset[int] = self._compute_used_unit_ids()
 
         # 告警管理
         self._alarm_manager = AlarmStateManager()
@@ -347,6 +356,19 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
         """目前被停用的點位"""
         return frozenset(self._disabled_points)
 
+    @property
+    def used_unit_ids(self) -> frozenset[int]:
+        """此設備實際觸及的 Modbus unit_id 集合（SMA multi-unit 場景用）。
+
+        包含 ``DeviceConfig.unit_id`` 以及任何 ``ReadPoint`` / ``WritePoint``
+        以 ``unit_id`` 欄位覆寫的值。``None`` sentinel 已 resolve 為
+        ``config.unit_id``，故集合內皆為具體 int。
+
+        Returns:
+            frozenset[int]: 至少包含 ``{config.unit_id}``
+        """
+        return self._used_unit_ids
+
     def get_point_info(self) -> list[PointInfo]:
         """取得所有點位的詳細資訊（含啟用狀態）"""
         infos: list[PointInfo] = []
@@ -430,6 +452,9 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
                     always_groups=self._grouper.group(list(self._read_points_always)),
                     rotating_groups=[self._grouper.group(list(pts)) for pts in self._read_points_rotating],
                 )
+                # 重建 ReadPoint lookup（含 reject_non_finite 策略）
+                self._read_point_lookup = self._build_read_point_lookup()
+                self._has_any_reject_non_finite = any(p.reject_non_finite for p in self._read_point_lookup.values())
 
             if spec.write_points is not None:
                 self._write_points = {wp.name: wp for wp in spec.write_points}
@@ -451,6 +476,10 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
             # 清理不再存在的 disabled_points
             valid_names = self.all_point_names
             self._disabled_points = self._disabled_points & valid_names
+
+            # 點位清單若有變動，重算 used_unit_ids
+            if any(s in changed_sections for s in ("always_points", "rotating_points", "write_points")):
+                self._used_unit_ids = self._compute_used_unit_ids()
         finally:
             if was_running:
                 await self.start()
@@ -633,20 +662,24 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
             # 更新值並發送變更事件
             await self._process_values(values)
 
-            # 執行告警評估
-            await self._evaluate_alarm(values)
+            # 若點位啟用 reject_non_finite 且本輪值非有限，下游（告警評估、
+            # READ_COMPLETE payload、回傳值）應看到舊 latest。
+            effective_values = self._resolve_effective_values(values)
+
+            # 執行告警評估（使用 effective_values，避免 NaN 讓閾值比較失效）
+            await self._evaluate_alarm(effective_values)
 
             duration_ms = (time.monotonic() - start_time) * 1000
             self._emitter.emit(
                 EVENT_READ_COMPLETE,
                 ReadCompletePayload(
                     device_id=self._config.device_id,
-                    values=values,
+                    values=effective_values,
                     duration_ms=duration_ms,
                 ),
             )
 
-            return values
+            return effective_values
 
         except CommunicationError as e:
             # 已有正確 device_id 的 CommunicationError 直接傳播
@@ -689,13 +722,20 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
         return raw_values
 
     async def _read_loop(self) -> None:
-        """讀取循環（含自動重連）"""
+        """讀取循環（含自動重連）。
+
+        採用絕對時間錨定（absolute time anchoring）避免時序漂移：
+        以 ``next_tick_delay`` helper 統一計算 sleep delay，補償 read 耗時。
+        重連成功後重設 anchor 與 completed 計數，避免斷線期間錯過的 tick
+        在重連瞬間 burst catch-up 壓垮設備。
+        """
         interval = self._config.read_interval
         reconnect_interval = self._config.reconnect_interval
 
-        while not self._stop_event.is_set():
-            start_time = time.monotonic()
+        anchor = time.monotonic()
+        n = 0
 
+        while not self._stop_event.is_set():
             # 未連線時嘗試重連
             if not self._client_connected:
                 try:
@@ -705,6 +745,9 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
                         self._device_responsive = True
                         self._consecutive_failures = 0
                     await self._emitter.emit_await(EVENT_CONNECTED, ConnectedPayload(device_id=self._config.device_id))
+                    # 重連成功後重設 anchor 與計數，避免 burst catch-up
+                    anchor = time.monotonic()
+                    n = 0
                 except DeviceConnectionError:
                     # 重連失敗，等待後重試
                     await asyncio.sleep(reconnect_interval)
@@ -720,9 +763,8 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
             except Exception as e:
                 logger.warning(f"[{self._config.device_id}] Read loop error: {e}")
 
-            elapsed = time.monotonic() - start_time
-            sleep_time = max(0, interval - elapsed)
-            await asyncio.sleep(sleep_time)
+            delay, anchor, n = next_tick_delay(anchor, n, interval)
+            await asyncio.sleep(delay)
 
     async def _handle_read_failure(self, error_msg: str) -> None:
         """處理讀取失敗：累加計數 + 記錄失敗時間 + 發送錯誤事件"""
@@ -761,11 +803,25 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
             )
 
     async def _process_values(self, values: dict[str, Any]) -> None:
-        """處理讀取到的值，發送變更事件（跳過 disabled 點位）"""
+        """處理讀取到的值，發送變更事件（跳過 disabled 點位）。
+
+        若 ReadPoint 設定 ``reject_non_finite=True`` 且新值為非有限 float
+        （NaN / +Inf / -Inf），此點位：
+
+          - 保留 ``_latest_values`` 中的舊值（不覆寫）
+          - log WARNING
+          - 不發送 ``EVENT_VALUE_CHANGE``
+        """
         for name, new_value in values.items():
             if name in self._disabled_points:
                 continue
             try:
+                if self._should_reject_non_finite(name, new_value):
+                    logger.warning(
+                        f"[{self._config.device_id}] Point '{name}' got non-finite value "
+                        f"{new_value!r}, keeping previous latest value (reject_non_finite=True)"
+                    )
+                    continue
                 old_value = self._latest_values.get(name)
                 if old_value != new_value:
                     self._emitter.emit(
@@ -780,6 +836,74 @@ class AsyncModbusDevice(AlarmMixin, WriteMixin):
                 self._latest_values[name] = new_value
             except Exception as e:
                 logger.warning(f"[{self._config.device_id}] Event processing failed for point '{name}': {e}")
+
+    def _compute_used_unit_ids(self) -> frozenset[int]:
+        """計算此設備實際觸及的 unit_id 集合。
+
+        Point-level ``unit_id=None`` 視為使用 device 預設（``config.unit_id``），
+        故結果一定包含 ``config.unit_id``；非 None 的 override 額外加入集合。
+        """
+        used: set[int] = {self._config.unit_id}
+        for point in self._read_points_always:
+            if point.unit_id is not None:
+                used.add(point.unit_id)
+        for group in self._read_points_rotating:
+            for point in group:
+                if point.unit_id is not None:
+                    used.add(point.unit_id)
+        for wp in self._write_points.values():
+            if wp.unit_id is not None:
+                used.add(wp.unit_id)
+        return frozenset(used)
+
+    def _build_read_point_lookup(self) -> dict[str, ReadPoint]:
+        """建立 point_name → ReadPoint 的查詢表，供 per-point 策略使用。
+
+        同名點位以 always_points 為優先，rotating 中若有重複名稱不會覆寫。
+        """
+        lookup: dict[str, ReadPoint] = {p.name: p for p in self._read_points_always}
+        for group in self._read_points_rotating:
+            for point in group:
+                lookup.setdefault(point.name, point)
+        return lookup
+
+    def _should_reject_non_finite(self, name: str, value: Any) -> bool:
+        """判斷某點位的新值是否應被 reject。
+
+        Args:
+            name: 點位名稱
+            value: 讀取到的原始值
+
+        Returns:
+            True 代表該點位啟用 ``reject_non_finite`` 且 value 為非有限 float，
+            呼叫端應跳過該點位的 latest 更新與事件發送。
+        """
+        if not self._has_any_reject_non_finite:
+            return False
+        point = self._read_point_lookup.get(name)
+        if point is None or not point.reject_non_finite:
+            return False
+        return is_non_finite_float(value)
+
+    def _resolve_effective_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        """將 reject_non_finite 命中的點位替換為 ``_latest_values`` 中的舊值。
+
+        供 ``read_once`` 輸出給下游（告警評估、``EVENT_READ_COMPLETE`` payload、
+        回傳值）的統一視圖。未命中 reject 的點位原值傳遞；命中者若有舊 latest
+        則取舊值，否則仍保留原始非有限值（首輪無歷史可退回）。
+
+        無任何點位開啟 reject_non_finite 時走快速路徑直接回傳原 dict，
+        避免每 read cycle 多做一次 O(N) 複製。
+        """
+        if not self._has_any_reject_non_finite:
+            return values
+        effective: dict[str, Any] = {}
+        for name, value in values.items():
+            if self._should_reject_non_finite(name, value) and name in self._latest_values:
+                effective[name] = self._latest_values[name]
+            else:
+                effective[name] = value
+        return effective
 
     # =============== Magic Methods =========
 
